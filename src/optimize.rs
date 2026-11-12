@@ -1,9 +1,9 @@
-//! `--optimize`: prüft Volume- und NTFS-Einstellungen, die Datei-I/O bremsen,
-//! und wendet mit `--fix` die sicheren Korrekturen über `fsutil` an.
+//! `--optimize`: checks volume and NTFS settings that slow down file I/O,
+//! and applies the safe fixes via `fsutil` when `--fix` is given.
 //!
-//! Bewusst NICHT automatisch: `8dot3name strip` (kann Registry-Pfade auf
-//! Kurznamen brechen), Defender-Ausnahmen (Sicherheit), Defragmentierung
-//! und chkdsk – die werden nur als Hinweis mit dem passenden Befehl genannt.
+//! Intentionally NOT automated: `8dot3name strip` (can break registry paths
+//! that point to short names), Defender exclusions (security), defragmentation
+//! and chkdsk – these are only mentioned as hints with the matching command.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -19,13 +19,31 @@ use ntfs_unthrottle::tune::{
 };
 use ntfs_unthrottle::{display_path, fragment_count, volume_info};
 
-/// Bekannte QLC-SSD-Familien: Nach dem SLC-Cache bricht die Schreibrate ein.
+use crate::i18n::{tr, DriverHint};
+
+/// Known QLC SSD families: once the SLC cache is full, the write rate collapses.
 const QLC_MODELS: &[&str] = &["QVO", "660P", "670P", "CT500P1", "CT1000P1", "CT2000P1", "P2 ", "NV2"];
 
-/// Ab so vielen MFT-Datensätzen lohnt eine größere MFT-Zone.
+/// From this many MFT records on, a larger MFT zone pays off.
 const LARGE_MFT_RECORDS: u64 = 2_000_000;
-/// Ab so vielen Fragmenten gilt die MFT als zerstückelt.
+/// From this many fragments on, the MFT counts as fragmented.
 const MFT_FRAGMENT_WARN: u64 = 64;
+
+/// Row labels of the optimizer output (localized in `i18n`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLabel {
+    Drive,
+    FileSystem,
+    Space,
+    Cluster,
+    Mft,
+    ShortNames,
+    BypassIo,
+    LastAccess,
+    TrimNtfs,
+    TrimRefs,
+    MftZone,
+}
 
 struct Fix {
     title: String,
@@ -48,33 +66,35 @@ impl Plan {
     }
 }
 
-fn ok(label: &str, value: impl std::fmt::Display) {
-    println!("  {} {:<13}{}", style("✔").green(), label, value);
+fn ok(label: OptLabel, value: impl std::fmt::Display) {
+    println!("  {} {:<13}{}", style("✔").green(), tr().opt_label(label), value);
 }
-fn warn(label: &str, value: impl std::fmt::Display) {
-    println!("  {} {:<13}{}", style("⚠").yellow().bold(), label, style(value).yellow());
+fn warn(label: OptLabel, value: impl std::fmt::Display) {
+    println!("  {} {:<13}{}", style("⚠").yellow().bold(), tr().opt_label(label), style(value).yellow());
 }
-fn info(label: &str, value: impl std::fmt::Display) {
-    println!("  {} {:<13}{}", style("ℹ").blue(), label, value);
+fn info(label: OptLabel, value: impl std::fmt::Display) {
+    println!("  {} {:<13}{}", style("ℹ").blue(), tr().opt_label(label), value);
 }
 
-/// Erklärung für bekannte Treiber, die BypassIO verhindern.
-fn bypass_driver_hint(driver: &str) -> &'static str {
+/// Classifies known drivers that prevent BypassIO.
+fn bypass_driver_kind(driver: &str) -> DriverHint {
     match driver.to_ascii_lowercase().as_str() {
-        "wof.sys" => "WOF-Komprimierung (CompactOS/compact /exe) – betroffene Dateien mit \
-                      `ntfs-unthrottle <Ordner> --recommended --fix` entpacken",
-        "fvevol.sys" => "BitLocker-Verschlüsselung des Volumes",
-        "volsnap.sys" => "Volumeschattenkopie/Wiederherstellungspunkt aktiv",
+        "wof.sys" => DriverHint::Wof,
+        "fvevol.sys" => DriverHint::BitLocker,
+        "volsnap.sys" => DriverHint::VolSnap,
         "storahci.sys" | "iastorvd.sys" | "iastorac.sys" | "iastora.sys" | "rsttcs.sys" => {
-            "Speichertreiber ohne BypassIO (SATA/AHCI bzw. Intel RST/VMD) – nur der \
-             Microsoft-NVMe-Treiber (stornvme.sys) unterstützt BypassIO"
+            DriverHint::StorageDriver
         }
-        _ => "Filtertreiber (z. B. Virenscanner, Backup, Sync, Verschlüsselung) – \
-              Hersteller-Update prüfen",
+        _ => DriverHint::Other,
     }
 }
 
-/// `E:\` → `E:` (so erwartet fsutil Laufwerksbuchstaben), Mount-Punkte bleiben.
+/// Explanation for a driver that prevents BypassIO (localized).
+fn bypass_driver_hint(driver: &str) -> &'static str {
+    tr().driver_hint(bypass_driver_kind(driver))
+}
+
+/// `E:\` → `E:` (the form fsutil expects for drive letters); mount points stay as-is.
 fn fsutil_volume(root: &Path) -> String {
     let s = display_path(root);
     let t = s.trim_end_matches('\\');
@@ -86,7 +106,8 @@ fn fsutil_volume(root: &Path) -> String {
 }
 
 pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
-    // Volumes der angegebenen Pfade, ohne Duplikate.
+    let l = tr();
+    // Volumes of the given paths, without duplicates.
     let mut volumes: BTreeMap<String, PathBuf> = BTreeMap::new();
     for p in paths {
         let v = volume_info(p).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", p.display())))?;
@@ -96,13 +117,13 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
     let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_lowercase();
     let reg_8dot3 = filesystem_reg_value("NtfsDisable8dot3NameCreation");
     let mut plan = Plan::default();
-    // TRIM-Schalter sind global, aber je Dateisystem getrennt.
+    // TRIM switches are global, but separate per file system.
     let mut any_ntfs_ssd = false;
     let mut any_refs_ssd = false;
     let mut any_large_mft = false;
     let mut admin_hint = false;
 
-    println!("{} Prüfe {} Volume(s)\n", style("[Optimierer]").bold().cyan(), volumes.len());
+    println!("{} {}\n", style(l.opt_tag()).bold().cyan(), l.opt_checking_volumes(volumes.len()));
 
     for root in volumes.values() {
         let vol = fsutil_volume(root);
@@ -115,26 +136,22 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
             "{} {}{}",
             style(format!("[{}]", display_path(root))).bold(),
             vi.fs_name,
-            if is_system { "  (Systemlaufwerk)" } else { "" }
+            if is_system { l.system_drive_suffix() } else { "" }
         );
 
-        // --- Datenträger ---------------------------------------------------
+        // --- Storage device ---------------------------------------------------
         match device_info(root) {
             Ok(d) => {
                 let kind = match d.seek_penalty {
                     Some(true) => "HDD",
                     Some(false) => "SSD",
-                    None => "Typ unbekannt",
+                    None => l.type_unknown(),
                 };
-                let trim = match d.trim_supported {
-                    Some(true) => ", TRIM ✔",
-                    Some(false) => ", kein TRIM",
-                    None => "",
-                };
+                let trim = l.trim_suffix(d.trim_supported);
                 let line = format!(
                     "{} ({}, {kind}{trim})",
                     d.product.as_deref().unwrap_or("?"),
-                    d.bus.unwrap_or("?")
+                    d.bus.map_or("?", |b| l.bus(b))
                 );
                 is_nvme = d.bus == Some("NVMe");
                 if d.seek_penalty == Some(false) {
@@ -143,251 +160,207 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
                 }
                 let product = d.product.as_deref().unwrap_or("").to_uppercase();
                 if QLC_MODELS.iter().any(|m| product.contains(m)) {
-                    plan.hints.push(format!(
-                        "{vol} ist eine QLC-SSD ({}). Nach einigen GiB am Stück ist ihr SLC-Cache voll, dann fällt die Schreibrate auf HDD-Niveau – das ist Hardware, kein Einstellungsproblem. Große Entpack-/Kopierjobs besser auf einer TLC/NVMe-SSD ausführen und erst danach verschieben; mehr freier Platz vergrößert den Cache.",
-                        d.product.as_deref().unwrap_or("?")
-                    ));
+                    plan.hints.push(l.hint_qlc(&vol, d.product.as_deref().unwrap_or("?")));
                 }
                 match (d.seek_penalty, d.bus) {
                     (Some(true), _) => {
-                        warn("Datenträger:", line);
-                        plan.hints.push(format!(
-                            "{vol} ist eine HDD: Viele kleine Dateien sind dort grundsätzlich langsam. \
-                             Regelmäßig defragmentieren: `defrag {vol} /U /V`"
-                        ));
+                        warn(OptLabel::Drive, line);
+                        plan.hints.push(l.hint_hdd(&vol));
                     }
                     (_, Some("USB")) => {
-                        warn("Datenträger:", line);
-                        plan.hints.push(format!(
-                            "{vol} hängt an USB – Durchsatz und Latenz sind durch Kabel/Gehäuse begrenzt, \
-                             nicht durch NTFS."
-                        ));
+                        warn(OptLabel::Drive, line);
+                        plan.hints.push(l.hint_usb(&vol));
                     }
-                    _ => ok("Datenträger:", line),
+                    _ => ok(OptLabel::Drive, line),
                 }
             }
-            Err(e) => info("Datenträger:", format!("nicht abfragbar ({e})")),
+            Err(e) => info(OptLabel::Drive, l.not_queryable_err(e)),
         }
 
         if is_refs {
-            info("Dateisystem:", "ReFS (z. B. Dev Drive) – MFT/8.3 entfallen, TRIM siehe [Global]");
+            info(OptLabel::FileSystem, l.refs_info());
         }
 
-        // --- Platz, Cluster, MFT ------------------------------------------
+        // --- Space, clusters, MFT ---------------------------------------------
         if is_ntfs {
             match ntfs_data(root) {
                 Ok(n) => {
                     let free_pct = n.free_bytes as f64 / n.total_bytes.max(1) as f64 * 100.0;
-                    let line = format!(
-                        "{} frei von {} ({free_pct:.0} %)",
+                    let line = l.space_line(
                         format_size(n.free_bytes, BINARY),
-                        format_size(n.total_bytes, BINARY)
+                        format_size(n.total_bytes, BINARY),
+                        free_pct,
                     );
                     if free_pct < 10.0 {
-                        warn("Platz:", line);
-                        plan.hints.push(format!(
-                            "{vol} ist zu über 90 % voll – NTFS findet kaum noch zusammenhängende \
-                             Bereiche, neue Dateien zerstückeln."
-                        ));
+                        warn(OptLabel::Space, line);
+                        plan.hints.push(l.hint_full(&vol));
                     } else {
-                        ok("Platz:", line);
+                        ok(OptLabel::Space, line);
                     }
-                    info("Cluster:", format_size(n.bytes_per_cluster, BINARY));
+                    info(OptLabel::Cluster, format_size(n.bytes_per_cluster, BINARY));
 
                     let records = n.mft_records();
                     let frags = fragment_count(&root.join("$MFT")).ok();
-                    let mut line = format!(
-                        "{} (≈ {:.1} Mio. Datensätze), Zone {}",
+                    let mut line = l.mft_line(
                         format_size(n.mft_valid_length, BINARY),
                         records as f64 / 1e6,
-                        format_size(n.mft_zone_bytes, BINARY)
+                        format_size(n.mft_zone_bytes, BINARY),
                     );
                     if let Some(f) = frags {
-                        line.push_str(&format!(", {f} Fragment(e)"));
+                        line.push_str(&l.mft_fragments(f));
                     }
                     if records >= LARGE_MFT_RECORDS {
                         any_large_mft = true;
                     }
                     if frags.is_some_and(|f| f >= MFT_FRAGMENT_WARN) {
-                        warn("MFT:", line);
-                        plan.hints.push(format!(
-                            "Die MFT auf {vol} ist zerstückelt. Windows kann sie im laufenden Betrieb \
-                             nicht defragmentieren; nur offline/Drittanbieter oder Neuformatierung."
-                        ));
+                        warn(OptLabel::Mft, line);
+                        plan.hints.push(l.hint_mft_fragmented(&vol));
                     } else {
-                        ok("MFT:", line);
+                        ok(OptLabel::Mft, line);
                     }
                 }
                 Err(_) => {
-                    info("MFT:", "nur als Administrator abfragbar");
+                    info(OptLabel::Mft, l.admin_only());
                     admin_hint = true;
                 }
             }
 
-            // --- 8.3-Kurznamen ----------------------------------------------
+            // --- 8.3 short names --------------------------------------------
             let vol_flag = short_names_disabled_on_volume(root).ok();
             let enabled = match reg_8dot3 {
                 Some(1) => Some(false),
                 Some(0) => Some(true),
                 Some(3) => Some(is_system),
-                // 2 (Standard) bzw. fehlend: Volume-Flag entscheidet.
+                // 2 (default) or missing: the volume flag decides.
                 _ => vol_flag.map(|d| !d),
             };
             match enabled {
-                Some(false) => ok("8.3-Namen:", "aus"),
-                Some(true) if is_system => {
-                    info("8.3-Namen:", "aktiv (Systemlaufwerk – bewusst nicht geändert)");
-                }
+                Some(false) => ok(OptLabel::ShortNames, l.word_off()),
+                Some(true) if is_system => info(OptLabel::ShortNames, l.short_names_system()),
                 Some(true) => {
-                    warn("8.3-Namen:", "aktiv – kostet bei jedem neuen Dateinamen eine Kollisionsprüfung");
+                    warn(OptLabel::ShortNames, l.short_names_active());
                     if reg_8dot3 == Some(0) {
-                        plan.fix(
-                            "8.3-Namen pro Volume steuerbar machen (global)",
-                            &["8dot3name", "set", "2"],
-                            Some("Ändert nichts an C:, solange dort das Volume-Flag aktiv bleibt."),
-                        );
+                        plan.fix(l.fix_8dot3_global(), &["8dot3name", "set", "2"], Some(l.note_8dot3_global()));
                     }
                     plan.fix(
-                        format!("8.3-Namen auf {vol} abschalten"),
+                        l.fix_8dot3_volume(&vol),
                         &["8dot3name", "set", &vol, "1"],
-                        Some("Bestehende Kurznamen bleiben – `8dot3name strip` wird bewusst nicht ausgeführt."),
+                        Some(l.note_8dot3_volume()),
                     );
                 }
-                None => info("8.3-Namen:", "nicht abfragbar"),
+                None => info(OptLabel::ShortNames, l.not_queryable()),
             }
 
-            // --- Dirty-Bit ------------------------------------------------
+            // --- Dirty bit ----------------------------------------------------
             match volume_dirty(root) {
                 Ok(true) => {
-                    warn("Dateisystem:", "Dirty-Bit gesetzt");
-                    plan.hints.push(format!(
-                        "{vol} ist als fehlerhaft markiert. Prüfen mit `chkdsk {vol} /scan` (online)."
-                    ));
+                    warn(OptLabel::FileSystem, l.dirty_bit_set());
+                    plan.hints.push(l.hint_dirty(&vol));
                 }
-                Ok(false) => ok("Dateisystem:", "sauber"),
+                Ok(false) => ok(OptLabel::FileSystem, l.fs_clean()),
                 Err(_) => admin_hint = true,
             }
 
-            // --- BypassIO (nur Diagnose, nie Filter entladen) ---------------
-            let diag = format!(
-                "Diagnose: `fsutil bypassIo state /v {}` und `fltmc filters` (als Administrator).",
-                display_path(root)
-            );
+            // --- BypassIO (diagnosis only, never unload filters) ------------
+            let diag = l.bypass_diag(display_path(root));
             match bypass_io_status(root) {
-                Ok(BypassIoStatus::Active { storage_compatible: true }) => ok("BypassIO:", "aktiv"),
+                Ok(BypassIoStatus::Active { storage_compatible: true }) => {
+                    ok(OptLabel::BypassIo, l.word_active());
+                }
                 Ok(BypassIoStatus::Active { storage_compatible: false }) => {
-                    info("BypassIO:", "kein Veto, Speichertreiber meldet aber keine BypassIO-Fähigkeit");
+                    info(OptLabel::BypassIo, l.bypass_no_storage());
                 }
                 Ok(BypassIoStatus::Partial { driver, status, reason }) => {
-                    info(
-                        "BypassIO:",
-                        format!("partiell (Volume-/Speicher-Stack: {driver} – {})", bypass_driver_hint(&driver)),
-                    );
+                    info(OptLabel::BypassIo, l.bypass_partial(&driver, bypass_driver_hint(&driver)));
                     if is_nvme {
-                        plan.hints.push(format!(
-                            "BypassIO auf {vol} nur partiell: {driver} ({reason}, Status 0x{status:08X}). \
-                             {} {diag}",
-                            bypass_driver_hint(&driver)
+                        plan.hints.push(l.hint_bypass_partial(
+                            &vol,
+                            &driver,
+                            &reason,
+                            status,
+                            bypass_driver_hint(&driver),
+                            &diag,
                         ));
                     }
                 }
                 Ok(BypassIoStatus::Blocked { driver, status, reason }) => {
-                    let line = format!("blockiert durch {driver}");
+                    let line = l.bypass_blocked_by(&driver);
                     if is_nvme {
-                        warn("BypassIO:", line);
+                        warn(OptLabel::BypassIo, line);
                     } else {
-                        info("BypassIO:", line);
+                        info(OptLabel::BypassIo, line);
                     }
-                    plan.hints.push(format!(
-                        "BypassIO auf {vol} blockiert durch {driver} ({reason}, Status 0x{status:08X}): {}. \
-                         {diag} Minifilter bitte NICHT per `fltmc unload` entladen – das kann Schutz- \
-                         oder Sync-Funktionen abschalten.",
-                        bypass_driver_hint(&driver)
+                    plan.hints.push(l.hint_bypass_blocked(
+                        &vol,
+                        &driver,
+                        &reason,
+                        status,
+                        bypass_driver_hint(&driver),
+                        &diag,
                     ));
                 }
-                Ok(BypassIoStatus::Unavailable) => {
-                    info("BypassIO:", "nicht verfügbar (erst ab Windows 11)");
-                }
-                Err(e) => info("BypassIO:", format!("nicht abfragbar ({e})")),
+                Ok(BypassIoStatus::Unavailable) => info(OptLabel::BypassIo, l.bypass_unavailable()),
+                Err(e) => info(OptLabel::BypassIo, l.not_queryable_err(e)),
             }
         }
         println!();
     }
 
-    // --- Globale Schalter --------------------------------------------------
+    // --- Global switches ---------------------------------------------------
     println!("{}", style("[Global]").bold());
     match filesystem_reg_value("NtfsDisableLastAccessUpdate") {
-        Some(v) if v & 1 == 1 => ok("Last-Access:", "aus"),
+        Some(v) if v & 1 == 1 => ok(OptLabel::LastAccess, l.word_off()),
         _ => {
-            warn("Last-Access:", "aktiv – jeder Lesezugriff schreibt einen Zeitstempel");
-            plan.fix(
-                "Last-Access-Zeitstempel abschalten",
-                &["behavior", "set", "disablelastaccess", "1"],
-                None,
-            );
+            warn(OptLabel::LastAccess, l.last_access_active());
+            plan.fix(l.fix_last_access(), &["behavior", "set", "disablelastaccess", "1"], None);
         }
     }
     if any_ntfs_ssd {
         match filesystem_reg_value("DisableDeleteNotification") {
             Some(1) => {
-                warn("TRIM (NTFS):", "deaktiviert – die SSD wird mit der Zeit langsamer");
-                plan.fix(
-                    "TRIM für NTFS aktivieren",
-                    &["behavior", "set", "DisableDeleteNotify", "NTFS", "0"],
-                    None,
-                );
+                warn(OptLabel::TrimNtfs, l.trim_ntfs_disabled());
+                plan.fix(l.fix_trim_ntfs(), &["behavior", "set", "DisableDeleteNotify", "NTFS", "0"], None);
             }
-            _ => ok("TRIM (NTFS):", "aktiv"),
+            _ => ok(OptLabel::TrimNtfs, l.word_active()),
         }
     }
-    // Nur fragen (ggf. fsutil starten), wenn es überhaupt ein ReFS-Volume auf SSD gibt.
+    // Only query (possibly launching fsutil) if there is a ReFS volume on an SSD at all.
     if any_refs_ssd {
         match refs_trim_disabled() {
             Some(true) => {
-                warn("TRIM (ReFS):", "deaktiviert – Dev Drive/ReFS-SSD wird mit der Zeit langsamer");
-                plan.fix(
-                    "TRIM für ReFS aktivieren",
-                    &["behavior", "set", "DisableDeleteNotify", "ReFS", "0"],
-                    None,
-                );
+                warn(OptLabel::TrimRefs, l.trim_refs_disabled());
+                plan.fix(l.fix_trim_refs(), &["behavior", "set", "DisableDeleteNotify", "ReFS", "0"], None);
             }
-            Some(false) => ok("TRIM (ReFS):", "aktiv"),
-            None => info("TRIM (ReFS):", "nicht gesetzt (Standard: aktiv)"),
+            Some(false) => ok(OptLabel::TrimRefs, l.word_active()),
+            None => info(OptLabel::TrimRefs, l.trim_refs_unset()),
         }
     }
-    // 0 bzw. fehlend = Standard (Stufe 1).
+    // 0 or missing = default (level 1).
     let zone = filesystem_reg_value("NtfsMftZoneReservation").unwrap_or(0).max(1);
     if any_large_mft && zone < 2 {
-        warn("MFT-Zone:", format!("Stufe {zone} – zu klein für Volumes mit Millionen Dateien"));
-        plan.fix(
-            "Größere MFT-Zone reservieren (Stufe 2)",
-            &["behavior", "set", "mftzone", "2"],
-            Some("Wirkt erst nach einem Neustart und nur für künftiges MFT-Wachstum."),
-        );
+        warn(OptLabel::MftZone, l.mft_zone_small(zone));
+        plan.fix(l.fix_mft_zone(), &["behavior", "set", "mftzone", "2"], Some(l.note_mft_zone()));
     } else {
-        ok("MFT-Zone:", format!("Stufe {zone}"));
+        ok(OptLabel::MftZone, l.mft_zone_level(zone));
     }
 
-    // --- Ausgabe & Anwenden ------------------------------------------------
+    // --- Output & apply ------------------------------------------------------
     if !plan.hints.is_empty() {
-        println!("\n{}", style("Hinweise (nicht automatisch):").bold());
+        println!("\n{}", style(l.hints_header()).bold());
         for h in &plan.hints {
             println!("  • {h}");
         }
     }
     if admin_hint {
-        println!(
-            "\n  {} Einige Werte (MFT, Dirty-Bit) brauchen ein Terminal als Administrator.",
-            style("ℹ").blue()
-        );
+        println!("\n  {} {}", style("ℹ").blue(), l.admin_needed());
     }
 
     if plan.fixes.is_empty() {
-        println!("\n{} Keine Korrekturen nötig.", style("✔").green().bold());
+        println!("\n{} {}", style("✔").green().bold(), l.no_fixes_needed());
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!("\n{}", style("Korrekturen:").bold());
+    println!("\n{}", style(l.fixes_header()).bold());
     for f in &plan.fixes {
         println!("  • {}", f.title);
         println!("      {}", style(format!("fsutil {}", f.args.join(" "))).dim());
@@ -398,9 +371,9 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
 
     if !apply {
         println!(
-            "\n{} Nur Analyse. Mit {} werden die Korrekturen angewendet (als Administrator).",
+            "\n{} {}",
             style("ℹ").blue().bold(),
-            style("--optimize --fix").yellow().bold()
+            l.analysis_only_optimize(style("--optimize --fix").yellow().bold())
         );
         return Ok(ExitCode::from(crate::EXIT_FOUND));
     }
@@ -408,10 +381,10 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
     let prompt = format!(
         "\n{}\n{} ",
         style("─".repeat(60)).yellow(),
-        style(format!("▶ {} Korrektur(en) jetzt anwenden? [j/N]:", plan.fixes.len())).yellow().bold()
+        style(l.confirm_fixes(plan.fixes.len())).yellow().bold()
     );
     if !yes && !crate::confirm(&prompt)? {
-        println!("Abgebrochen.");
+        println!("{}", l.aborted());
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -422,7 +395,7 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
             Ok(o) if o.status.success() => println!("  {} {}", style("✔").green(), f.title),
             Ok(o) => {
                 failed += 1;
-                // fsutil schreibt in der OEM-Codepage – sonst werden Umlaute zu `�`.
+                // fsutil writes in the OEM code page – otherwise non-ASCII characters become `�`.
                 let msg = [decode_oem(&o.stdout), decode_oem(&o.stderr)]
                     .iter()
                     .map(|s| s.trim())
@@ -438,11 +411,28 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
         }
     }
     if failed > 0 {
-        println!(
-            "\n  {} {failed} Korrektur(en) fehlgeschlagen – meist fehlen Administratorrechte.",
-            style("⚠").yellow().bold()
-        );
+        println!("\n  {} {}", style("⚠").yellow().bold(), l.fixes_failed(failed));
         return Ok(ExitCode::from(crate::EXIT_PARTIAL));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bypass_driver_classification() {
+        assert_eq!(bypass_driver_kind("WOF.SYS"), DriverHint::Wof);
+        assert_eq!(bypass_driver_kind("fvevol.sys"), DriverHint::BitLocker);
+        assert_eq!(bypass_driver_kind("iaStorVD.sys"), DriverHint::StorageDriver);
+        assert_eq!(bypass_driver_kind("someav.sys"), DriverHint::Other);
+    }
+
+    #[test]
+    fn fsutil_volume_form() {
+        assert_eq!(fsutil_volume(Path::new(r"E:\")), "E:");
+        assert_eq!(fsutil_volume(Path::new(r"\\?\E:\")), "E:");
+        assert_eq!(fsutil_volume(Path::new(r"C:\Mount\Data\")), r"C:\Mount\Data\");
+    }
 }
