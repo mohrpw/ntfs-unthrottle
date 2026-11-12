@@ -16,14 +16,15 @@ use windows_sys::Win32::Foundation::{
     ERROR_SHARING_VIOLATION, ERROR_USER_MAPPED_FILE, HANDLE, NO_ERROR, SetLastError,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, COMPRESSION_FORMAT_NONE, FILE_ATTRIBUTE_COMPRESSED,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_PROVIDER_COMPRESSION_LZX,
-    FILE_PROVIDER_COMPRESSION_XPRESS16K, FILE_PROVIDER_COMPRESSION_XPRESS4K,
-    FILE_PROVIDER_COMPRESSION_XPRESS8K, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, GetCompressedFileSizeW,
-    GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle, GetVolumeInformationW,
-    GetVolumePathNameW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW, WOF_PROVIDER_FILE,
+    BY_HANDLE_FILE_INFORMATION, COMPRESSION_FORMAT_NONE, FILE_ALLOCATION_INFO,
+    FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_PROVIDER_COMPRESSION_LZX, FILE_PROVIDER_COMPRESSION_XPRESS16K,
+    FILE_PROVIDER_COMPRESSION_XPRESS4K, FILE_PROVIDER_COMPRESSION_XPRESS8K, FILE_READ_ATTRIBUTES,
+    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+    FileAllocationInfo, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetFileAttributesW,
+    GetFileInformationByHandle, GetVolumeInformationW, GetVolumePathNameW,
+    INVALID_FILE_ATTRIBUTES, SetFileAttributesW, SetFileInformationByHandle, WOF_PROVIDER_FILE,
 };
 use windows_sys::Win32::System::Ioctl::{
     FILE_PROVIDER_EXTERNAL_INFO_V1, FSCTL_DELETE_EXTERNAL_BACKING, FSCTL_GET_EXTERNAL_BACKING,
@@ -518,6 +519,53 @@ pub fn remove_compression(path: &Path, kind: CompressionKind) -> io::Result<()> 
     }
 }
 
+pub(crate) fn open_uncompressed_with(opts: &OpenOptions, path: &Path) -> io::Result<File> {
+    let file = match opts.clone().read(true).open(path) {
+        Ok(f) => f,
+        // Without FILE_READ_DATA the FSCTL cannot succeed: just open/create with caller options.
+        Err(e) if os_code(&e) == Some(ERROR_ACCESS_DENIED) => return opts.open(path),
+        Err(e) => return Err(e),
+    };
+    if has_compressed_attr(&file) {
+        // Best-effort, see create_uncompressed / UncompressedOpenOptions.
+        let _ = disable_compression(&file);
+    }
+    Ok(file)
+}
+
+/// Reserves contiguous disk clusters for `file` (`SetFileInformationByHandle`
+/// with `FileAllocationInfo`) without changing the logical file size (`EOF`).
+///
+/// Works on both NTFS and ReFS (Dev Drive). Unlike `set_len`, interrupted
+/// sequential writes do not leave a fake zero-padded file of `size` bytes, and
+/// existing files that are already `>= size` (e.g. opened with `.append(true)`)
+/// are never truncated. `size == 0` is a no-op.
+pub fn preallocate(file: &File, size: u64) -> io::Result<()> {
+    if size == 0 {
+        return Ok(());
+    }
+    let alloc = i64::try_from(size)
+        .map_err(|_| io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32))?;
+    if file.metadata()?.len() >= size {
+        return Ok(());
+    }
+    let info = FILE_ALLOCATION_INFO { AllocationSize: alloc };
+    // SAFETY: `file` is a valid handle and `info` is a plain POD struct matching FileAllocationInfo.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            raw_handle(file),
+            FileAllocationInfo,
+            (&info as *const FILE_ALLOCATION_INFO).cast(),
+            std::mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Creates (or truncates) a file and disables NTFS compression **before** any
 /// data is written – protects your own tools against a compressed target folder.
 ///
@@ -539,20 +587,9 @@ pub fn remove_compression(path: &Path, kind: CompressionKind) -> io::Result<()> 
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn create_uncompressed<P: AsRef<Path>>(path: P) -> io::Result<File> {
-    let path = path.as_ref();
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    let file = match opts.clone().read(true).open(path) {
-        Ok(f) => f,
-        // Without FILE_READ_DATA the FSCTL cannot succeed: just create the file.
-        Err(e) if os_code(&e) == Some(ERROR_ACCESS_DENIED) => return opts.open(path),
-        Err(e) => return Err(e),
-    };
-    if has_compressed_attr(&file) {
-        // Best-effort, see the doc comment.
-        let _ = disable_compression(&file);
-    }
-    Ok(file)
+    open_uncompressed_with(&opts, path.as_ref())
 }
 
 /// Does the open file carry `FILE_ATTRIBUTE_COMPRESSED`? Unknown → `true`,
@@ -933,5 +970,84 @@ mod tests {
             assert_eq!(ia.links, 2);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_options_ext_supports_create_new_and_custom_flags() {
+        use crate::UncompressedOpenOptions;
+        use std::io::Write;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
+
+        let Some(dir) = compressed_temp_dir("ext") else { return };
+        let path = dir.0.join("unique.bin");
+
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+            .open_uncompressed(&path)
+            .unwrap();
+        f.write_all(b"hello").unwrap();
+        drop(f);
+        assert!(!is_compressed(&path));
+
+        // create_new must fail if the file already exists without overwriting it.
+        let err = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open_uncompressed(&path)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn preallocate_and_create_with_size_preserve_existing_data() {
+        use crate::{create_uncompressed_with_size, UncompressedOpenOptions};
+        use std::io::Write;
+
+        let dir = TempDir::new("prealloc");
+        let p = dir.0.join("sized.bin");
+        let mut f = create_uncompressed_with_size(&p, 256 * 1024).unwrap();
+        // FileAllocationInfo must NOT change logical EOF before writing.
+        assert_eq!(f.metadata().unwrap().len(), 0);
+        f.write_all(&[0xABu8; 8192]).unwrap();
+        drop(f);
+        assert_eq!(fs::metadata(&p).unwrap().len(), 8192);
+        assert_eq!(compression_kind(&p).unwrap(), None);
+
+        // Append with size < existing_len and size == 0 must NEVER truncate existing bytes.
+        let mut f_small = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open_uncompressed_with_size(&p, 1024)
+            .unwrap();
+        assert_eq!(f_small.metadata().unwrap().len(), 8192);
+        preallocate(&f_small, 0).unwrap();
+        assert_eq!(f_small.metadata().unwrap().len(), 8192);
+        f_small.write_all(b"tail").unwrap();
+        drop(f_small);
+        let data = fs::read(&p).unwrap();
+        assert_eq!(data.len(), 8192 + 4);
+        assert!(data.ends_with(b"tail"));
+
+        // Values > i64::MAX must be rejected cleanly with ERROR_INVALID_PARAMETER.
+        let ro = OpenOptions::new().read(true).open(&p).unwrap();
+        let err = preallocate(&ro, u64::MAX).unwrap_err();
+        assert_eq!(os_code(&err), Some(ERROR_INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn create_uncompressed_with_size_in_compressed_dir() {
+        use crate::create_uncompressed_with_size;
+        use std::io::Write;
+
+        let Some(dir) = compressed_temp_dir("cuws") else { return };
+        let path = dir.0.join("pre.bin");
+        let mut f = create_uncompressed_with_size(&path, 128 * 1024).unwrap();
+        f.write_all(&[1u8; 128 * 1024]).unwrap();
+        drop(f);
+        assert!(!is_compressed(&path));
+        assert_eq!(fs::metadata(&path).unwrap().len(), 128 * 1024);
     }
 }

@@ -4,11 +4,20 @@
 //! functions behave like their `std` counterparts. Everything else in this crate
 //! (queries, decompression, `tune`) is Windows-only.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
 
 use crate::CompressionKind;
+
+pub(crate) fn open_uncompressed_with(opts: &OpenOptions, path: &Path) -> io::Result<File> {
+    opts.open(path)
+}
+
+/// No-op on this platform.
+pub fn preallocate(_file: &File, _size: u64) -> io::Result<()> {
+    Ok(())
+}
 
 /// Creates (or truncates) a file – on this platform simply `File::create`.
 ///
