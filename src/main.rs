@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+mod optimize;
+
 use clap::Parser;
 use console::style;
 use humansize::{format_size, BINARY};
@@ -131,6 +133,11 @@ struct Cli {
     /// Alle Kandidaten und Ordner auflisten statt nur der größten
     #[arg(short, long)]
     verbose: bool,
+
+    /// Optimierer: Datenträger, MFT, 8.3-Namen, Last-Access, TRIM der Volumes prüfen
+    /// (mit --fix sichere Korrekturen per fsutil anwenden). Scannt keine Dateien.
+    #[arg(long)]
+    optimize: bool,
 
     /// Ausschließen: Name (z. B. node_modules – greift überall) oder Pfad (z. B. E:\Backup).
     /// Mehrfach angebbar. Systemordner sind immer geschützt.
@@ -268,6 +275,8 @@ impl Reason {
 }
 
 struct Candidate {
+    /// Index des Scan-Pfads (für die Volume-Zuordnung).
+    root: usize,
     path: PathBuf,
     logical: u64,
     physical: u64,
@@ -315,6 +324,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> io::Result<ExitCode> {
+    if cli.optimize {
+        return optimize::run(&cli.paths, cli.fix, cli.yes);
+    }
     // Kanonische \\?\-Pfade: damit funktionieren auch Pfade > 260 Zeichen mit
     // den rohen Win32-Aufrufen.
     let mut roots = Vec::new();
@@ -358,8 +370,8 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
 
     let excludes = Excludes::new(cli)?;
     let mut scan = Scan::default();
-    for root in &roots {
-        scan_tree(cli, root, &excludes, &mut scan, &spinner);
+    for (i, root) in roots.iter().enumerate() {
+        scan_tree(cli, i, root, &excludes, &mut scan, &spinner);
     }
     spinner.finish_and_clear();
     scan.files.sort_by_key(|f| std::cmp::Reverse(f.logical));
@@ -401,7 +413,10 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
         return Ok(ExitCode::from(EXIT_FOUND));
     }
 
-    check_free_space(&scan.files)?;
+    print!("\n  Prüfe freien Platz …");
+    io::stdout().flush()?;
+    check_free_space(&roots, &scan.files)?;
+    println!(" ok");
 
     let prompt = format!(
         "\n{}\n{} ",
@@ -503,7 +518,7 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     Ok(ExitCode::from(EXIT_PARTIAL))
 }
 
-fn scan_tree(cli: &Cli, root: &Path, excludes: &Excludes, scan: &mut Scan, spinner: &ProgressBar) {
+fn scan_tree(cli: &Cli, root_idx: usize, root: &Path, excludes: &Excludes, scan: &mut Scan, spinner: &ProgressBar) {
     let min_bytes = cli.min_size.saturating_mul(1024 * 1024);
 
     // filter_entry verhindert auch das Absteigen in ausgeschlossene Ordner.
@@ -615,6 +630,7 @@ fn scan_tree(cli: &Cli, root: &Path, excludes: &Excludes, scan: &mut Scan, spinn
                     fragment_count(path).ok()
                 };
                 scan.files.push(Candidate {
+                    root: root_idx,
                     path: path.to_path_buf(),
                     logical,
                     physical,
@@ -733,11 +749,14 @@ fn print_report(cli: &Cli, scan: &Scan, took: Duration) {
 }
 
 /// Prüft je Volume, ob genug Platz zum Entpacken frei ist (+ 256 MiB bzw. 1 % Puffer).
-fn check_free_space(files: &[Candidate]) -> io::Result<()> {
+/// Das Volume wird einmal je Scan-Pfad ermittelt (Junctions/Mount-Punkte
+/// werden beim Scan nicht verfolgt, alle Dateien eines Pfads liegen also darauf).
+fn check_free_space(roots: &[PathBuf], files: &[Candidate]) -> io::Result<()> {
+    let vols: Vec<Option<VolumeInfo>> = roots.iter().map(|r| volume_info(r).ok()).collect();
     let mut need: BTreeMap<PathBuf, (u64, Option<VolumeInfo>)> = BTreeMap::new();
     for f in files {
-        let Ok(v) = volume_info(&f.path) else { continue };
-        let e = need.entry(v.root.clone()).or_insert((0, Some(v)));
+        let Some(v) = &vols[f.root] else { continue };
+        let e = need.entry(v.root.clone()).or_insert((0, Some(v.clone())));
         e.0 += f.logical.saturating_sub(f.physical);
     }
     for (root, (bytes, info)) in need {

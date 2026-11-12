@@ -38,6 +38,8 @@ use windows_sys::Win32::System::Ioctl::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
+pub mod tune;
+
 /// `FILE_FILE_COMPRESSION` aus winnt.h (spart das SystemServices-Feature).
 const FILE_FILE_COMPRESSION: u32 = 0x0000_0010;
 
