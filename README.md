@@ -3,12 +3,31 @@
 Viele Windows-Laufwerke oder Ordner nutzen unbemerkt transparente Komprimierung –
 entweder klassisch per NTFS (LZNT1, blaue Doppelpfeile im Explorer) oder per
 **Windows Overlay Filter (WOF / CompactOS)**, der *gar kein* sichtbares Attribut setzt.
-Bei großen, bereits gepackten oder verschlüsselten Dateien (`.xci`, `.nsp`, `.nca`,
-Archive, Videos, Images) spart das praktisch keinen Platz, kostet aber CPU beim
-Schreiben und bremst Entpack-/Kopiervorgänge aus – ohne Fehlermeldung.
+Bei großen, bereits gepackten oder verschlüsselten Dateien (Archive, Videos,
+Disk-Images wie `.iso`, Asset-Container wie `.pak`) spart das praktisch keinen Platz,
+kostet aber CPU beim Schreiben und bremst Entpack-/Kopiervorgänge aus – ohne Fehlermeldung.
 
 `ntfs-unthrottle` spürt solche kontraproduktiven Komprimierungen auf und entfernt sie
 direkt über die Win32-API (`DeviceIoControl`), ohne `compact.exe`.
+
+## Praxis-Benchmark (Entstehungsmessung, Stand `v0.2.0`)
+
+`ntfs-unthrottle` entstand aus einem realen Performance-Post-Mortem beim Entpacken
+eines verschlüsselten `6,27-GB`-Binärcontainers (`3.848` Einzeldateien) unter
+Windows 11 auf einer SATA-SSD (`Samsung 870 QVO`, NTFS). Obwohl das Laufwerks-Root
+`E:\` im Explorer unkomprimiert wirkte, trugen die Ziel-Unterordner vererbtes
+`FILE_ATTRIBUTE_COMPRESSED` (LZNT1): kaum Platzersparnis (`1,1 : 1` bis `1,2 : 1`),
+aber `NTFS.sys` prüfte jede `64-KiB`-Compression-Unit synchron beim Schreiben –
+selbst paralleler Rust-Code (`rayon`, `seek_read`, AES-NI) skalierte kaum.
+
+| Messung (`E:\`, vererbte NTFS-Komprimierung → unkomprimiert) | Vorher | Nachher | Speedup |
+|---|---:|---:|---:|
+| Beobachteter Container-Unpack (End-to-End) | `~200 s` | `~30 s` | **~6,7×** |
+| Kontrolllauf Schritt 1 (Container-Extraktion, `6,27 GB`) | `111,64 s` | `13,05 s` | **~8,6×** |
+| Kontrolllauf gesamt (Container + Entschlüsselung von `3.848` Dateien, freier SLC-Cache) | `218,67 s` | `85,74 s` | **~2,6×** |
+
+*(Referenzwert auf unkomprimierter NVMe-SSD `C:`: `22,43–31,09 s`. Ein aktualisierter
+Benchmark für `v0.6.0` inkl. WOF/DirectStorage/BypassIO folgt.)*
 
 ## Was das Tool macht
 
@@ -40,10 +59,10 @@ Zusätzlich warnt das Tool, wenn **übergeordnete** Ordner des Scan-Pfads das Fl
 
 ```powershell
 # Analyse (Dry-Run, ändert nichts)
-ntfs-unthrottle D:\Games\Switch
+ntfs-unthrottle D:\Games\Library
 
 # Bereinigen mit Rückfrage
-ntfs-unthrottle D:\Games\Switch --fix
+ntfs-unthrottle D:\Games\Library --fix
 
 # Skript/Scheduled Task: alles ab 50 MiB, ohne Rückfrage
 ntfs-unthrottle E:\Workspace F:\ISOs --fix --yes --min-size 50
@@ -77,8 +96,13 @@ werden **unabhängig von Größe und Quote** immer entpackt:
   unfertige Downloads (`.part`, `.crdownload`, `.!qb`, …). Komprimierung zerstückelt
   solche Dateien stark.
 - **Alles in Build-/Tooling-Ordnern** (Grund `Build-Ordner`): `node_modules`, `.git`,
-  `target`, `obj`, `.vs`, `__pycache__`, `.venv`/`venv`, `.gradle`, `.next`, `build`,
-  `dist`, `.cargo`, `.nuget`, `.m2`, … – viele kleine, ständig neu geschriebene Dateien.
+  `.vs`, `__pycache__`, `.venv`/`venv`, `.gradle`, `.next`, `.cargo`, `.nuget`, `.m2`, … –
+  viele kleine, ständig neu geschriebene Dateien. Die generischen Namen `build`, `dist`,
+  `target` und `obj` zählen nur, wenn der Ordner daneben ein Projekt-Marker liegt
+  (`package.json`, `Cargo.toml`, `pyproject.toml`, `CMakeLists.txt`, `Makefile`, `.git`,
+  `*.sln` bzw. für `target` `Cargo.toml`/`pom.xml`, für `obj` `*.csproj`/`*.vcxproj`) –
+  `D:\Games\Titel\dist` bleibt also unangetastet. Ordner oberhalb des Scan-Pfads zählen
+  nicht. Unter `--min-size` wird dort nur klassische NTFS-Komprimierung (LZNT1) erfasst.
 - **WOF in DirectStorage-Spielen auf NVMe** (Grund `DirectStorage`): Liegt im Spielordner
   `dstorage.dll`/`dstoragecore.dll` und ist das Volume eine NVMe-SSD, werden die WOF-Dateien
   des Spiels entpackt – WOF verhindert dort den BypassIO-Pfad (Windows 11) und bremst die
@@ -105,7 +129,9 @@ Pro Scan-Pfad zeigt der Scan den Datenträger (`NVMe-SSD`, `SATA-SSD`, `HDD`, �
 Grenzen: WOF-Dateien unter `--min-size` bleiben außen vor (sonst müsste jede kleine Datei
 geöffnet werden). Mit `--no-wof` oder wenn der DLL-Ordner per `-x` ausgeschlossen ist, greift
 die Erkennung nicht. Überlappende Scan-Pfade (`E:\Games E:\Games\Spiel`) werden
-zusammengefasst und nur einmal gescannt.
+zusammengefasst und nur einmal gescannt. Hardlinks (z. B. Mod-Manager-Staging ↔ Spielordner)
+werden nur einmal erfasst und als `Hardlink-Duplikate übersprungen` gezählt. Auf exFAT/FAT/ReFS
+entfällt die WOF-Prüfung (WOF gibt es nur auf NTFS).
 
 ```powershell
 ntfs-unthrottle E:\ --recommended          # ansehen
@@ -124,12 +150,23 @@ Komprimierung bremst:
 | MFT-Größe, Datensätze, Fragmente, MFT-Zone | `fsutil behavior set mftzone 2` bei ≥ 2 Mio. Datensätzen |
 | 8.3-Kurznamen pro Volume | `fsutil 8dot3name set E: 1` (nie auf dem Systemlaufwerk) |
 | Last-Access-Zeitstempel | `fsutil behavior set disablelastaccess 1` |
-| TRIM bei SSDs | `fsutil behavior set DisableDeleteNotify NTFS 0` |
+| TRIM bei NTFS-SSDs | `fsutil behavior set DisableDeleteNotify NTFS 0` |
+| TRIM bei ReFS-SSDs (Dev Drive) | `fsutil behavior set DisableDeleteNotify ReFS 0` |
+| BypassIO (Windows 11, NTFS): aktiv / partiell / blockiert durch `<treiber.sys>` | – (Hinweis auf `fsutil bypassIo state /v E:\` und `fltmc filters`) |
 | Dirty-Bit | – (Hinweis auf `chkdsk E: /scan`) |
 
+Die BypassIO-Zeile ist eine reine Lese-Abfrage (`FSCTL_MANAGE_BYPASS_IO` mit
+`FS_BPIO_OP_QUERY`, ohne Administratorrechte). Sie unterscheidet zwischen Filter-Stack
+(Minifilter wie `wof.sys` oder Virenscanner → `⚠ blockiert`) und Volume-/Speicher-Stack
+(z. B. `fvevol.sys` bei BitLocker, SATA-/RST-Treiber → `partiell`). So lässt sich auch
+klären, ob ein Intel-VMD-/RAID-Controller BypassIO verhindert. Den ReFS-TRIM-Status liest
+das Tool aus `RefsDisableDeleteNotification` in der Registry oder, falls der Wert fehlt,
+aus `fsutil behavior query DisableDeleteNotify ReFS`. Geprüft wird das nur, wenn ein
+ReFS-Volume auf einer SSD liegt.
+
 Bewusst **nicht** automatisch: `8dot3name strip` (kann Programme brechen, die
-Kurznamen in der Registry gespeichert haben), Defender-Ausnahmen, Defragmentierung
-und chkdsk. Alle Korrekturen laufen sichtbar über `fsutil` und lassen sich damit auch
+Kurznamen in der Registry gespeichert haben), Defender-Ausnahmen, Defragmentierung,
+chkdsk und das Entladen von Minifiltern (`fltmc unload`). Alle Korrekturen laufen sichtbar über `fsutil` und lassen sich damit auch
 wieder zurücksetzen.
 
 ```powershell
@@ -175,7 +212,7 @@ Zieldatei abschalten – solange sie 0 Byte groß ist, kostet das < 1 ms:
 ```rust
 use std::io::Write;
 
-let mut out = ntfs_unthrottle::create_uncompressed("D:/out/game.xci".as_ref())?;
+let mut out = ntfs_unthrottle::create_uncompressed("D:/out/archive.bin".as_ref())?;
 out.write_all(&data)?;
 ```
 

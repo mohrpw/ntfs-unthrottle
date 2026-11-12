@@ -1,6 +1,6 @@
 [package]
 name = "ntfs-unthrottle"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.83"
 description = "Spürt kontraproduktive NTFS-/WOF-Komprimierung auf großen Binärdateien auf und entfernt sie."
@@ -29,6 +29,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_Globalization",
     "Win32_System_Ioctl",
     "Win32_System_Registry",
 ] }
