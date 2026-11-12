@@ -1,3 +1,8 @@
+#[cfg(not(windows))]
+compile_error!(
+    "the ntfs-unthrottle CLI only supports Windows – use the library with default-features = false"
+);
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::os::windows::fs::MetadataExt;

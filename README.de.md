@@ -312,27 +312,50 @@ und greift auch bei direkter Angabe (`ntfs-unthrottle E:\$RECYCLE.BIN`,
 ## Als Rust-Bibliothek verwenden
 
 Wer eigene Entpacker oder Konverter in Rust schreibt, kann die NTFS-Komprimierung beim
-Anlegen der Zieldatei direkt abschalten – solange sie 0 Byte groß ist, kostet das `< 1 ms`:
+Anlegen der Zieldatei direkt abschalten – solange sie 0 Byte groß ist, kostet das `< 1 ms`.
+Mit abgeschalteten Default-Features wird statt der CLI-Abhängigkeiten nur `windows-sys`
+eingebunden:
 
 ```toml
 # Cargo.toml
 [dependencies]
-ntfs-unthrottle = { git = "https://github.com/mohrpw/ntfs-unthrottle.git" }
+ntfs-unthrottle = { git = "https://github.com/mohrpw/ntfs-unthrottle.git", default-features = false }
 ```
+
+| Feature | Standard | Inhalt |
+|---|---|---|
+| `cli` | ja | Das Programm `ntfs-unthrottle` (`clap`, `console`, `humansize`, `indicatif`, `walkdir`); aktiviert `tune` |
+| `tune` | über `cli` | `ntfs_unthrottle::tune` – Volume-/Laufwerksdiagnose (TRIM, BypassIO, MFT, 8.3-Namen) |
 
 ```rust
 use std::io::Write;
 
 fn main() -> std::io::Result<()> {
-    let mut out = ntfs_unthrottle::create_uncompressed("D:/out/archive.bin".as_ref())?;
+    ntfs_unthrottle::create_dir_all_uncompressed("D:/out/romfs")?;
+    let mut out = ntfs_unthrottle::create_uncompressed("D:/out/romfs/archive.bin")?;
     out.write_all(&data)?;
     Ok(())
 }
 ```
 
-Für bereits offene Dateien: `ntfs_unthrottle::disable_compression(&file)` – das Handle
-braucht dafür Lese- **und** Schreibzugriff (`File::create` allein reicht nicht). Auf
-FAT/exFAT/ReFS sind beide Funktionen ein No-op.
+- `create_uncompressed(path)` – legt eine Datei an (bzw. kürzt sie) und schaltet die
+  Komprimierung **nur dann** ab, wenn sie `FILE_ATTRIBUTE_COMPRESSED` geerbt hat: in normalen
+  Ordnern fällt kein zusätzlicher IOCTL an. Der Schutz ist **best-effort**: lehnt z. B. ein
+  Filtertreiber das FSCTL ab, wird die Datei trotzdem zurückgegeben; gemeldet werden nur
+  Fehler beim Öffnen/Anlegen.
+- `create_dir_all_uncompressed(path)` – wie `std::fs::create_dir_all`, löscht aber das
+  Komprimierungs-Flag auf jedem neu angelegten Ordner und auf dem Zielordner selbst
+  (bestehende Ordner darüber bleiben unverändert). Ebenfalls best-effort.
+- `clear_dir_compression(dir)` – löscht das Komprimierungs-Flag eines Ordners, falls gesetzt.
+- `compression_kind(path)` – `None`, `Some(Lznt1)` oder `Some(Wof(..))`, z. B. für einen
+  Hinweis vorab, dass eine Eingabedatei komprimiert auf der Platte liegt.
+- Für bereits offene Dateien meldet `disable_compression(&file)` Fehler – das Handle braucht
+  dafür Lese- **und** Schreibzugriff (`File::create` allein reicht nicht). Auf FAT/exFAT/ReFS
+  ist es ein No-op.
+
+Auf anderen Plattformen als Windows kompilieren die obigen Funktionen als günstige No-ops
+(`File::create`, `std::fs::create_dir_all`, `Ok(None)` …) – Aufrufer brauchen keine eigenen
+`cfg`-Weichen. Die übrige API und das CLI gibt es nur unter Windows.
 
 ---
 

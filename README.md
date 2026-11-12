@@ -299,27 +299,48 @@ directly on the command line (skipped with `⛔`, remaining paths proceed normal
 ## Using as a Rust Library
 
 If you write custom unpackers or converters in Rust, disable NTFS compression immediately
-upon file creation (`< 1 ms` while 0 bytes):
+upon file creation (`< 1 ms` while 0 bytes). Turn off the default features so that only
+`windows-sys` is pulled in instead of the CLI dependencies:
 
 ```toml
 # Cargo.toml
 [dependencies]
-ntfs-unthrottle = { git = "https://github.com/mohrpw/ntfs-unthrottle.git" }
+ntfs-unthrottle = { git = "https://github.com/mohrpw/ntfs-unthrottle.git", default-features = false }
 ```
+
+| Feature | Default | Contents |
+|---|---|---|
+| `cli` | yes | The `ntfs-unthrottle` binary (`clap`, `console`, `humansize`, `indicatif`, `walkdir`); enables `tune` |
+| `tune` | via `cli` | `ntfs_unthrottle::tune` – volume/drive diagnostics (TRIM, BypassIO, MFT, 8.3 names) |
 
 ```rust
 use std::io::Write;
 
 fn main() -> std::io::Result<()> {
-    let mut out = ntfs_unthrottle::create_uncompressed("D:/out/archive.bin".as_ref())?;
+    ntfs_unthrottle::create_dir_all_uncompressed("D:/out/romfs")?;
+    let mut out = ntfs_unthrottle::create_uncompressed("D:/out/romfs/archive.bin")?;
     out.write_all(&data)?;
     Ok(())
 }
 ```
 
-For existing handles, call `ntfs_unthrottle::disable_compression(&file)` (requires both
-`read` and `write` access; `File::create` alone is insufficient for `FSCTL_SET_COMPRESSION`).
-Both functions are no-ops on FAT/exFAT/ReFS.
+- `create_uncompressed(path)` – creates/truncates a file and disables compression **only if**
+  it inherited `FILE_ATTRIBUTE_COMPRESSED`: on normal folders no extra IOCTL is issued.
+  The guard is **best-effort**: if the FSCTL is rejected (e.g. by a filter driver), the file
+  is still returned; only open/create errors are reported.
+- `create_dir_all_uncompressed(path)` – like `std::fs::create_dir_all`, but clears the
+  compression flag on every newly created folder and on the target folder itself
+  (existing folders above it are left alone). Also best-effort.
+- `clear_dir_compression(dir)` – clears a folder's compression flag if set.
+- `compression_kind(path)` – `None`, `Some(Lznt1)` or `Some(Wof(..))`, e.g. for a pre-flight
+  warning that an input file is stored compressed.
+- For existing handles, `disable_compression(&file)` reports errors (requires both `read` and
+  `write` access; `File::create` alone is insufficient for `FSCTL_SET_COMPRESSION`). It is a
+  no-op on FAT/exFAT/ReFS.
+
+On non-Windows platforms the functions above compile as cheap no-ops (`File::create`,
+`std::fs::create_dir_all`, `Ok(None)` …), so callers need no `cfg` switches. The rest of the
+API and the CLI are Windows-only.
 
 ---
 
