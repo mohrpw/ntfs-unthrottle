@@ -14,7 +14,8 @@ use console::style;
 use humansize::{format_size, BINARY};
 
 use ntfs_unthrottle::tune::{
-    device_info, filesystem_reg_value, ntfs_data, short_names_disabled_on_volume, volume_dirty,
+    bypass_io_status, decode_oem, device_info, filesystem_reg_value, ntfs_data, refs_trim_disabled,
+    short_names_disabled_on_volume, volume_dirty, BypassIoStatus,
 };
 use ntfs_unthrottle::{display_path, fragment_count, volume_info};
 
@@ -57,6 +58,22 @@ fn info(label: &str, value: impl std::fmt::Display) {
     println!("  {} {:<13}{}", style("ℹ").blue(), label, value);
 }
 
+/// Erklärung für bekannte Treiber, die BypassIO verhindern.
+fn bypass_driver_hint(driver: &str) -> &'static str {
+    match driver.to_ascii_lowercase().as_str() {
+        "wof.sys" => "WOF-Komprimierung (CompactOS/compact /exe) – betroffene Dateien mit \
+                      `ntfs-unthrottle <Ordner> --recommended --fix` entpacken",
+        "fvevol.sys" => "BitLocker-Verschlüsselung des Volumes",
+        "volsnap.sys" => "Volumeschattenkopie/Wiederherstellungspunkt aktiv",
+        "storahci.sys" | "iastorvd.sys" | "iastorac.sys" | "iastora.sys" | "rsttcs.sys" => {
+            "Speichertreiber ohne BypassIO (SATA/AHCI bzw. Intel RST/VMD) – nur der \
+             Microsoft-NVMe-Treiber (stornvme.sys) unterstützt BypassIO"
+        }
+        _ => "Filtertreiber (z. B. Virenscanner, Backup, Sync, Verschlüsselung) – \
+              Hersteller-Update prüfen",
+    }
+}
+
 /// `E:\` → `E:` (so erwartet fsutil Laufwerksbuchstaben), Mount-Punkte bleiben.
 fn fsutil_volume(root: &Path) -> String {
     let s = display_path(root);
@@ -79,7 +96,9 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
     let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_lowercase();
     let reg_8dot3 = filesystem_reg_value("NtfsDisable8dot3NameCreation");
     let mut plan = Plan::default();
-    let mut any_ssd = false;
+    // TRIM-Schalter sind global, aber je Dateisystem getrennt.
+    let mut any_ntfs_ssd = false;
+    let mut any_refs_ssd = false;
     let mut any_large_mft = false;
     let mut admin_hint = false;
 
@@ -89,6 +108,9 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
         let vol = fsutil_volume(root);
         let is_system = vol.to_lowercase() == system_drive;
         let vi = volume_info(root)?;
+        let is_ntfs = vi.fs_name.eq_ignore_ascii_case("NTFS");
+        let is_refs = vi.fs_name.eq_ignore_ascii_case("ReFS");
+        let mut is_nvme = false;
         println!(
             "{} {}{}",
             style(format!("[{}]", display_path(root))).bold(),
@@ -114,8 +136,10 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
                     d.product.as_deref().unwrap_or("?"),
                     d.bus.unwrap_or("?")
                 );
+                is_nvme = d.bus == Some("NVMe");
                 if d.seek_penalty == Some(false) {
-                    any_ssd = true;
+                    any_ntfs_ssd |= is_ntfs;
+                    any_refs_ssd |= is_refs;
                 }
                 let product = d.product.as_deref().unwrap_or("").to_uppercase();
                 if QLC_MODELS.iter().any(|m| product.contains(m)) {
@@ -145,8 +169,12 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
             Err(e) => info("Datenträger:", format!("nicht abfragbar ({e})")),
         }
 
+        if is_refs {
+            info("Dateisystem:", "ReFS (z. B. Dev Drive) – MFT/8.3 entfallen, TRIM siehe [Global]");
+        }
+
         // --- Platz, Cluster, MFT ------------------------------------------
-        if vi.fs_name.eq_ignore_ascii_case("NTFS") {
+        if is_ntfs {
             match ntfs_data(root) {
                 Ok(n) => {
                     let free_pct = n.free_bytes as f64 / n.total_bytes.max(1) as f64 * 100.0;
@@ -239,6 +267,49 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
                 Ok(false) => ok("Dateisystem:", "sauber"),
                 Err(_) => admin_hint = true,
             }
+
+            // --- BypassIO (nur Diagnose, nie Filter entladen) ---------------
+            let diag = format!(
+                "Diagnose: `fsutil bypassIo state /v {}` und `fltmc filters` (als Administrator).",
+                display_path(root)
+            );
+            match bypass_io_status(root) {
+                Ok(BypassIoStatus::Active { storage_compatible: true }) => ok("BypassIO:", "aktiv"),
+                Ok(BypassIoStatus::Active { storage_compatible: false }) => {
+                    info("BypassIO:", "kein Veto, Speichertreiber meldet aber keine BypassIO-Fähigkeit");
+                }
+                Ok(BypassIoStatus::Partial { driver, status, reason }) => {
+                    info(
+                        "BypassIO:",
+                        format!("partiell (Volume-/Speicher-Stack: {driver} – {})", bypass_driver_hint(&driver)),
+                    );
+                    if is_nvme {
+                        plan.hints.push(format!(
+                            "BypassIO auf {vol} nur partiell: {driver} ({reason}, Status 0x{status:08X}). \
+                             {} {diag}",
+                            bypass_driver_hint(&driver)
+                        ));
+                    }
+                }
+                Ok(BypassIoStatus::Blocked { driver, status, reason }) => {
+                    let line = format!("blockiert durch {driver}");
+                    if is_nvme {
+                        warn("BypassIO:", line);
+                    } else {
+                        info("BypassIO:", line);
+                    }
+                    plan.hints.push(format!(
+                        "BypassIO auf {vol} blockiert durch {driver} ({reason}, Status 0x{status:08X}): {}. \
+                         {diag} Minifilter bitte NICHT per `fltmc unload` entladen – das kann Schutz- \
+                         oder Sync-Funktionen abschalten.",
+                        bypass_driver_hint(&driver)
+                    ));
+                }
+                Ok(BypassIoStatus::Unavailable) => {
+                    info("BypassIO:", "nicht verfügbar (erst ab Windows 11)");
+                }
+                Err(e) => info("BypassIO:", format!("nicht abfragbar ({e})")),
+            }
         }
         println!();
     }
@@ -256,17 +327,32 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
             );
         }
     }
-    if any_ssd {
+    if any_ntfs_ssd {
         match filesystem_reg_value("DisableDeleteNotification") {
             Some(1) => {
-                warn("TRIM:", "deaktiviert – die SSD wird mit der Zeit langsamer");
+                warn("TRIM (NTFS):", "deaktiviert – die SSD wird mit der Zeit langsamer");
                 plan.fix(
                     "TRIM für NTFS aktivieren",
                     &["behavior", "set", "DisableDeleteNotify", "NTFS", "0"],
                     None,
                 );
             }
-            _ => ok("TRIM:", "aktiv"),
+            _ => ok("TRIM (NTFS):", "aktiv"),
+        }
+    }
+    // Nur fragen (ggf. fsutil starten), wenn es überhaupt ein ReFS-Volume auf SSD gibt.
+    if any_refs_ssd {
+        match refs_trim_disabled() {
+            Some(true) => {
+                warn("TRIM (ReFS):", "deaktiviert – Dev Drive/ReFS-SSD wird mit der Zeit langsamer");
+                plan.fix(
+                    "TRIM für ReFS aktivieren",
+                    &["behavior", "set", "DisableDeleteNotify", "ReFS", "0"],
+                    None,
+                );
+            }
+            Some(false) => ok("TRIM (ReFS):", "aktiv"),
+            None => info("TRIM (ReFS):", "nicht gesetzt (Standard: aktiv)"),
         }
     }
     // 0 bzw. fehlend = Standard (Stufe 1).
@@ -336,8 +422,13 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
             Ok(o) if o.status.success() => println!("  {} {}", style("✔").green(), f.title),
             Ok(o) => {
                 failed += 1;
-                let msg = String::from_utf8_lossy(&o.stdout).trim().to_string()
-                    + String::from_utf8_lossy(&o.stderr).trim();
+                // fsutil schreibt in der OEM-Codepage – sonst werden Umlaute zu `�`.
+                let msg = [decode_oem(&o.stdout), decode_oem(&o.stderr)]
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 println!("  {} {}: {}", style("✖").red(), f.title, style(msg).red());
             }
             Err(e) => {

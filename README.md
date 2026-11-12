@@ -10,6 +10,25 @@ Schreiben und bremst Entpack-/Kopiervorgänge aus – ohne Fehlermeldung.
 `ntfs-unthrottle` spürt solche kontraproduktiven Komprimierungen auf und entfernt sie
 direkt über die Win32-API (`DeviceIoControl`), ohne `compact.exe`.
 
+## Praxis-Benchmark (Entstehungsmessung, Stand `v0.2.0`)
+
+`ntfs-unthrottle` entstand aus einem realen Performance-Post-Mortem beim Entpacken
+eines Switch-Containers (`Zelda.nsp`, `6,27 GB`, `3.848` Dateien) unter Windows 11 auf
+einer SATA-SSD (`Samsung 870 QVO`, NTFS). Obwohl das Laufwerks-Root `E:\` im Explorer
+unkomprimiert wirkte, trugen die Ziel-Unterordner vererbtes `FILE_ATTRIBUTE_COMPRESSED`
+(LZNT1): kaum Platzersparnis (`1,1 : 1` bis `1,2 : 1`), aber `NTFS.sys` prüfte jede
+`64-KiB`-Compression-Unit synchron beim Schreiben – selbst paralleler Rust-Code
+(`rayon`, `seek_read`, AES-NI) skalierte kaum.
+
+| Messung (`E:\`, vererbte NTFS-Komprimierung → unkomprimiert) | Vorher | Nachher | Speedup |
+|---|---:|---:|---:|
+| Beobachteter NSP-Unpack (End-to-End) | `~200 s` | `~30 s` | **~6,7×** |
+| Kontrolllauf Schritt 1 (`pfs0`, `6,27 GB` Container) | `111,64 s` | `13,05 s` | **~8,6×** |
+| Kontrolllauf gesamt (`pfs0` + `nca`, `3.848` Dateien, freier SLC-Cache) | `218,67 s` | `85,74 s` | **~2,6×** |
+
+*(Referenzwert auf unkomprimierter NVMe-SSD `C:`: `22,43–31,09 s`. Ein aktualisierter
+Benchmark für `v0.6.0` inkl. WOF/DirectStorage/BypassIO folgt.)*
+
 ## Was das Tool macht
 
 1. **Scan** – durchläuft den Verzeichnisbaum (Metadaten aus `FindNextFile`, kein
@@ -131,12 +150,23 @@ Komprimierung bremst:
 | MFT-Größe, Datensätze, Fragmente, MFT-Zone | `fsutil behavior set mftzone 2` bei ≥ 2 Mio. Datensätzen |
 | 8.3-Kurznamen pro Volume | `fsutil 8dot3name set E: 1` (nie auf dem Systemlaufwerk) |
 | Last-Access-Zeitstempel | `fsutil behavior set disablelastaccess 1` |
-| TRIM bei SSDs | `fsutil behavior set DisableDeleteNotify NTFS 0` |
+| TRIM bei NTFS-SSDs | `fsutil behavior set DisableDeleteNotify NTFS 0` |
+| TRIM bei ReFS-SSDs (Dev Drive) | `fsutil behavior set DisableDeleteNotify ReFS 0` |
+| BypassIO (Windows 11, NTFS): aktiv / partiell / blockiert durch `<treiber.sys>` | – (Hinweis auf `fsutil bypassIo state /v E:\` und `fltmc filters`) |
 | Dirty-Bit | – (Hinweis auf `chkdsk E: /scan`) |
 
+Die BypassIO-Zeile ist eine reine Lese-Abfrage (`FSCTL_MANAGE_BYPASS_IO` mit
+`FS_BPIO_OP_QUERY`, ohne Administratorrechte). Sie unterscheidet zwischen Filter-Stack
+(Minifilter wie `wof.sys` oder Virenscanner → `⚠ blockiert`) und Volume-/Speicher-Stack
+(z. B. `fvevol.sys` bei BitLocker, SATA-/RST-Treiber → `partiell`). So lässt sich auch
+klären, ob ein Intel-VMD-/RAID-Controller BypassIO verhindert. Den ReFS-TRIM-Status liest
+das Tool aus `RefsDisableDeleteNotification` in der Registry oder, falls der Wert fehlt,
+aus `fsutil behavior query DisableDeleteNotify ReFS`. Geprüft wird das nur, wenn ein
+ReFS-Volume auf einer SSD liegt.
+
 Bewusst **nicht** automatisch: `8dot3name strip` (kann Programme brechen, die
-Kurznamen in der Registry gespeichert haben), Defender-Ausnahmen, Defragmentierung
-und chkdsk. Alle Korrekturen laufen sichtbar über `fsutil` und lassen sich damit auch
+Kurznamen in der Registry gespeichert haben), Defender-Ausnahmen, Defragmentierung,
+chkdsk und das Entladen von Minifiltern (`fltmc unload`). Alle Korrekturen laufen sichtbar über `fsutil` und lassen sich damit auch
 wieder zurücksetzen.
 
 ```powershell
