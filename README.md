@@ -77,8 +77,13 @@ werden **unabhängig von Größe und Quote** immer entpackt:
   unfertige Downloads (`.part`, `.crdownload`, `.!qb`, …). Komprimierung zerstückelt
   solche Dateien stark.
 - **Alles in Build-/Tooling-Ordnern** (Grund `Build-Ordner`): `node_modules`, `.git`,
-  `target`, `obj`, `.vs`, `__pycache__`, `.venv`/`venv`, `.gradle`, `.next`, `build`,
-  `dist`, `.cargo`, `.nuget`, `.m2`, … – viele kleine, ständig neu geschriebene Dateien.
+  `.vs`, `__pycache__`, `.venv`/`venv`, `.gradle`, `.next`, `.cargo`, `.nuget`, `.m2`, … –
+  viele kleine, ständig neu geschriebene Dateien. Die generischen Namen `build`, `dist`,
+  `target` und `obj` zählen nur, wenn der Ordner daneben ein Projekt-Marker liegt
+  (`package.json`, `Cargo.toml`, `pyproject.toml`, `CMakeLists.txt`, `Makefile`, `.git`,
+  `*.sln` bzw. für `target` `Cargo.toml`/`pom.xml`, für `obj` `*.csproj`/`*.vcxproj`) –
+  `D:\Games\Titel\dist` bleibt also unangetastet. Ordner oberhalb des Scan-Pfads zählen
+  nicht. Unter `--min-size` wird dort nur klassische NTFS-Komprimierung (LZNT1) erfasst.
 - **WOF in DirectStorage-Spielen auf NVMe** (Grund `DirectStorage`): Liegt im Spielordner
   `dstorage.dll`/`dstoragecore.dll` und ist das Volume eine NVMe-SSD, werden die WOF-Dateien
   des Spiels entpackt – WOF verhindert dort den BypassIO-Pfad (Windows 11) und bremst die
@@ -105,7 +110,9 @@ Pro Scan-Pfad zeigt der Scan den Datenträger (`NVMe-SSD`, `SATA-SSD`, `HDD`, �
 Grenzen: WOF-Dateien unter `--min-size` bleiben außen vor (sonst müsste jede kleine Datei
 geöffnet werden). Mit `--no-wof` oder wenn der DLL-Ordner per `-x` ausgeschlossen ist, greift
 die Erkennung nicht. Überlappende Scan-Pfade (`E:\Games E:\Games\Spiel`) werden
-zusammengefasst und nur einmal gescannt.
+zusammengefasst und nur einmal gescannt. Hardlinks (z. B. Mod-Manager-Staging ↔ Spielordner)
+werden nur einmal erfasst und als `Hardlink-Duplikate übersprungen` gezählt. Auf exFAT/FAT/ReFS
+entfällt die WOF-Prüfung (WOF gibt es nur auf NTFS).
 
 ```powershell
 ntfs-unthrottle E:\ --recommended          # ansehen

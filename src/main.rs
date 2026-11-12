@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -14,9 +14,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
 
 use ntfs_unthrottle::{
-    compressed_ancestors, describe_error, display_path, fragment_count, physical_size,
-    remove_compression, remove_ntfs_compression, volume_info, wof_algorithm, CompressionKind,
-    VolumeInfo, WofAlgorithm,
+    compressed_ancestors, describe_error_at, display_path, file_identity_of, fragment_count,
+    fragment_count_of, open_for_query, physical_size, remove_compression, remove_ntfs_compression,
+    volume_info, wof_algorithm_of, CompressionKind, VolumeInfo, WofAlgorithm,
 };
 use ntfs_unthrottle::tune::{device_info, DeviceInfo};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -57,11 +57,26 @@ const WRITE_HEAVY_EXTS: &[&str] = &[
 
 /// --recommended: Build-/Tooling-Ordner mit vielen kleinen, ständig neu
 /// geschriebenen Dateien – darin wird alles entpackt, unabhängig von Größe/Quote.
+/// Diese Namen sind eindeutig genug, um ohne weitere Prüfung zu gelten.
 const BUILD_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "obj", ".vs", ".idea", "__pycache__", ".venv", "venv",
+    "node_modules", ".git", ".vs", ".idea", "__pycache__", ".venv", "venv",
     ".tox", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle", ".next", ".nuxt",
-    ".turbo", ".parcel-cache", ".angular", ".svelte-kit", "build", "dist", ".cargo",
+    ".turbo", ".parcel-cache", ".angular", ".svelte-kit", ".cargo",
     ".rustup", ".nuget", ".m2", "go-build", "ccache", ".ccache",
+];
+
+/// Projekt-Marker (Dateien oder Ordner, `*.ext` = beliebiger Name mit Endung).
+const PROJECT_MARKERS: &[&str] = &[
+    "package.json", "Cargo.toml", "pyproject.toml", "CMakeLists.txt", "Makefile", ".git", "*.sln",
+];
+
+/// Generische Namen, die auch in Spielordnern vorkommen (`Spiel\dist`, `Spiel\build`).
+/// Sie zählen nur, wenn der direkte Elternordner einen passenden Projekt-Marker enthält.
+const GENERIC_BUILD_DIRS: &[(&str, &[&str])] = &[
+    ("build", PROJECT_MARKERS),
+    ("dist", PROJECT_MARKERS),
+    ("target", &["Cargo.toml", "pom.xml"]),
+    ("obj", &["*.csproj", "*.vcxproj", "*.fsproj", "*.vbproj", "*.sln"]),
 ];
 
 fn has_ext(path: &Path, list: &[&str]) -> bool {
@@ -70,12 +85,48 @@ fn has_ext(path: &Path, list: &[&str]) -> bool {
         .is_some_and(|e| list.contains(&e.to_ascii_lowercase().as_str()))
 }
 
-/// Liegt `path` (irgendwo) unterhalb eines Build-/Tooling-Ordners?
-fn in_build_dir(path: &Path) -> bool {
-    path.ancestors().skip(1).any(|p| {
-        p.file_name()
-            .is_some_and(|n| BUILD_DIRS.contains(&n.to_string_lossy().to_lowercase().as_str()))
+/// Enthält `dir` einen der `markers`? (Groß-/Kleinschreibung egal.)
+fn is_project_dir(dir: &Path, markers: &[&str]) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    rd.flatten().any(|e| {
+        let name = fold(&e.file_name());
+        markers.iter().any(|m| match m.strip_prefix('*') {
+            Some(ext) => name.len() > ext.len() && name.ends_with(&ext.to_lowercase()),
+            None => name == m.to_lowercase(),
+        })
     })
+}
+
+/// Liegt `path` unterhalb eines Build-/Tooling-Ordners? Geprüft werden nur der
+/// Scan-Root `root` und Ordner darunter – nicht, was darüber liegt
+/// (`E:\target\Spiele` als Scan-Pfad macht nicht alles zum Build-Ordner).
+/// `cache` merkt sich das Marker-Ergebnis je generischem Ordner.
+fn in_build_dir(path: &Path, root: &Path, cache: &mut HashMap<PathBuf, bool>) -> bool {
+    let mut cur = path.parent();
+    while let Some(dir) = cur {
+        if !dir.starts_with(root) {
+            break;
+        }
+        if let Some(name) = dir.file_name() {
+            let n = fold(name);
+            if BUILD_DIRS.contains(&n.as_str()) {
+                return true;
+            }
+            if let Some((_, markers)) = GENERIC_BUILD_DIRS.iter().find(|(g, _)| *g == n) {
+                let hit = *cache
+                    .entry(dir.to_path_buf())
+                    .or_insert_with(|| dir.parent().is_some_and(|p| is_project_dir(p, markers)));
+                if hit {
+                    return true;
+                }
+            }
+        }
+        if dir == root {
+            break;
+        }
+        cur = dir.parent();
+    }
+    false
 }
 
 const EXIT_FOUND: u8 = 2;
@@ -217,8 +268,18 @@ impl Excludes {
         let mut paths = Vec::new();
         for x in &cli.exclude {
             if x.contains(['\\', '/', ':']) {
-                let c = std::fs::canonicalize(x)
-                    .map_err(|e| io::Error::new(e.kind(), format!("--exclude {x}: {e}")))?;
+                let c = match std::fs::canonicalize(x) {
+                    Ok(c) => c,
+                    // Was es nicht gibt, kann auch nicht gescannt werden – kein Grund abzubrechen.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        println!(
+                            "{} --exclude {x}: existiert nicht – ignoriert.",
+                            style("ℹ").blue().bold()
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(io::Error::new(e.kind(), format!("--exclude {x}: {e}"))),
+                };
                 paths.push(c.to_string_lossy().to_lowercase());
             } else {
                 names.push(x.to_lowercase());
@@ -306,6 +367,11 @@ struct Scan {
     kept_files: u64,
     kept_bytes_saved: u64,
     small_compressed: u64,
+    /// Bereits erfasste Dateien mit mehreren Hardlinks: (Volume-Serial, Dateiindex).
+    seen_links: HashSet<(u32, u64)>,
+    hardlink_dupes: u64,
+    /// Marker-Ergebnis je generischem Build-Ordner (`build`, `dist`, …).
+    build_cache: HashMap<PathBuf, bool>,
     /// Ordner mit `dstorage.dll`/`dstoragecore.dll` (Scan-Root-Index, Ordner).
     ds_dll_dirs: Vec<(usize, PathBuf)>,
     /// Behaltene WOF-Dateien (≥ --min-size) für die Speichermedium-Regeln.
@@ -331,6 +397,13 @@ impl RootInfo {
 
     fn vol_root(&self) -> Option<&Path> {
         self.vol.as_ref().map(|v| v.root.as_path())
+    }
+
+    /// WOF (`wof.sys`) gibt es nur auf NTFS – unabhängig von `supports_compression`
+    /// (NTFS mit Clustern > 4 KiB kann kein LZNT1, WOF aber schon).
+    /// Unbekanntes Volume → sicherheitshalber prüfen.
+    fn wof_possible(&self) -> bool {
+        self.vol.as_ref().is_none_or(|v| v.fs_name.eq_ignore_ascii_case("NTFS"))
     }
 
     /// Nur echtes NVMe – RAID, Speicherplätze, USB-Gehäuse zählen nicht (kein BypassIO).
@@ -416,7 +489,7 @@ const LIBRARY_MARKERS: &[&[&str]] = &[
 const ENGINE_DIRS: &[&str] = &[
     "binaries", "win64", "win32", "wingdk", "x64", "x86", "x86_64", "arm64", "bin", "bin64",
     "shipping", "retail", "windows", "windowsnoeditor", "redist", "thirdparty", "directstorage",
-    "engine", "plugins",
+    "engine", "plugins", "content",
 ];
 
 /// Volume-Wurzel oder Mount-Punkt erreicht?
@@ -677,8 +750,8 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
 
     let excludes = Excludes::new(cli)?;
     let mut scan = Scan::default();
-    for (i, root) in roots.iter().enumerate() {
-        scan_tree(cli, i, root, &excludes, &mut scan, &spinner);
+    for (i, (root, info)) in roots.iter().zip(&infos).enumerate() {
+        scan_tree(cli, i, root, info, &excludes, &mut scan, &spinner);
     }
     spinner.finish_and_clear();
     scan.files.sort_by_key(|f| std::cmp::Reverse(f.logical));
@@ -699,7 +772,20 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
             style("⚠").yellow().bold()
         );
         for a in &ancestors {
-            println!("      {}", display_path(a));
+            if a.parent().is_none() {
+                // Laufwerkswurzel: wird bewusst nicht automatisch geändert.
+                println!(
+                    "      {}  {}",
+                    display_path(a),
+                    style(format!(
+                        "(Laufwerkswurzel – nur das Flag entfernen: compact /u {})",
+                        display_path(a)
+                    ))
+                    .dim()
+                );
+            } else {
+                println!("      {}", display_path(a));
+            }
         }
     }
 
@@ -757,7 +843,7 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
         for dir in &scan.dirs {
             match remove_ntfs_compression(dir, true) {
                 Ok(()) => fixed_dirs += 1,
-                Err(e) => failed.push((dir.clone(), describe_error(&e))),
+                Err(e) => failed.push((dir.clone(), describe_error_at(&e, dir))),
             }
             pb.inc(1);
         }
@@ -787,7 +873,7 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
                         freed_fragments += before.saturating_sub(after);
                     }
                 }
-                Err(e) => failed.push((f.path.clone(), describe_error(&e))),
+                Err(e) => failed.push((f.path.clone(), describe_error_at(&e, &f.path))),
             }
             pb.inc(f.logical);
         }
@@ -827,8 +913,18 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     Ok(ExitCode::from(EXIT_PARTIAL))
 }
 
-fn scan_tree(cli: &Cli, root_idx: usize, root: &Path, excludes: &Excludes, scan: &mut Scan, spinner: &ProgressBar) {
+fn scan_tree(
+    cli: &Cli,
+    root_idx: usize,
+    root: &Path,
+    info: &RootInfo,
+    excludes: &Excludes,
+    scan: &mut Scan,
+    spinner: &ProgressBar,
+) {
     let min_bytes = cli.min_size.saturating_mul(1024 * 1024);
+    // Auf exFAT/FAT/ReFS gibt es kein wof.sys – dort keine FSCTL-Abfragen pro Datei.
+    let skip_wof = cli.no_wof || !info.wof_possible();
 
     // filter_entry verhindert auch das Absteigen in ausgeschlossene Ordner.
     let excluded = std::cell::RefCell::new(Vec::new());
@@ -890,31 +986,46 @@ fn scan_tree(cli: &Cli, root_idx: usize, root: &Path, excludes: &Excludes, scan:
                 scan.ds_dll_dirs.push((root_idx, parent.to_path_buf()));
             }
         }
-        let write_heavy = cli.recommended && has_ext(path, WRITE_HEAVY_EXTS);
-        let build_dir = cli.recommended && !write_heavy && in_build_dir(path);
-
         let logical = meta.len();
-        if logical < min_bytes && !write_heavy && !build_dir {
-            if ntfs_compressed {
-                scan.small_compressed += 1;
-            }
+        let small = logical < min_bytes;
+        // Unter --min-size zählt nur LZNT1 (Attribut, kostenlos): sonst müsste jede
+        // kleine Datei (node_modules, .git …) für die WOF-Abfrage geöffnet werden.
+        if small && !ntfs_compressed {
+            continue;
+        }
+        let write_heavy = cli.recommended && has_ext(path, WRITE_HEAVY_EXTS);
+        let build_dir =
+            cli.recommended && !write_heavy && in_build_dir(path, root, &mut scan.build_cache);
+        if small && !write_heavy && !build_dir {
+            scan.small_compressed += 1;
             continue;
         }
 
+        // Ein Handle für WOF-Abfrage, Hardlink-Identität und Fragmente.
+        let handle = open_for_query(path).ok();
         let kind = if ntfs_compressed {
             CompressionKind::Lznt1
-        } else if cli.no_wof {
+        } else if skip_wof {
             continue;
         } else {
-            match wof_algorithm(path) {
-                Ok(Some(alg)) => CompressionKind::Wof(alg),
-                Ok(None) => continue,
-                Err(_) => {
+            match handle.as_ref().map(wof_algorithm_of) {
+                Some(Ok(Some(alg))) => CompressionKind::Wof(alg),
+                Some(Ok(None)) => continue,
+                _ => {
                     scan.errors += 1;
                     continue;
                 }
             }
         };
+
+        // Hardlinks (z. B. Mod-Manager-Staging ↔ Spielordner) nur einmal erfassen –
+        // sonst doppelt gezählt, doppelt im Platzbedarf und doppelt entpackt.
+        if let Some(id) = handle.as_ref().and_then(|h| file_identity_of(h).ok()) {
+            if id.links > 1 && !scan.seen_links.insert(id.key()) {
+                scan.hardlink_dupes += 1;
+                continue;
+            }
+        }
 
         let physical = physical_size(path).unwrap_or(logical);
         let r = ratio(physical, logical);
@@ -945,7 +1056,10 @@ fn scan_tree(cli: &Cli, root_idx: usize, root: &Path, excludes: &Excludes, scan:
                 let fragments = if cli.no_fragments || kind != CompressionKind::Lznt1 {
                     None
                 } else {
-                    fragment_count(path).ok()
+                    match &handle {
+                        Some(h) => fragment_count_of(h).ok(),
+                        None => fragment_count(path).ok(),
+                    }
                 };
                 scan.files.push(Candidate {
                     root: root_idx,
@@ -981,10 +1095,16 @@ fn scan_tree(cli: &Cli, root_idx: usize, root: &Path, excludes: &Excludes, scan:
 
 fn report_volume(info: &RootInfo) {
     match &info.vol {
-        Some(v) if !v.supports_compression => println!(
-            "      {} Dateisystem {} unterstützt keine Datei-Komprimierung – vermutlich nichts zu tun.",
+        Some(v) if !v.fs_name.eq_ignore_ascii_case("NTFS") => println!(
+            "      {} Dateisystem {}: WOF/CompactOS gibt es nur auf NTFS – WOF-Prüfung entfällt{}.",
             style("ℹ").blue(),
-            v.fs_name
+            v.fs_name,
+            if v.supports_compression { "" } else { ", Datei-Komprimierung ebenfalls nicht unterstützt" }
+        ),
+        Some(v) if !v.supports_compression => println!(
+            "      {} NTFS mit Clustern > 4 KiB: klassische NTFS-Komprimierung ist dort nicht möglich, \
+             WOF/CompactOS wird trotzdem geprüft.",
+            style("ℹ").blue()
         ),
         Some(_) => {}
         None => println!("      {} Volume-Info nicht lesbar", style("⚠").yellow()),
@@ -1084,6 +1204,16 @@ fn print_report(cli: &Cli, scan: &Scan, notes: &StorageNotes, took: Duration) {
             "  • Komprimiert, aber < {} MiB:        {} (ignoriert)",
             cli.min_size, scan.small_compressed
         );
+        if !cli.recommended && !cli.all {
+            println!(
+                "    {}",
+                style("Tipp: --recommended erfasst Build-Ordner, VM-Images & Datenbanken auch darunter.")
+                    .dim()
+            );
+        }
+    }
+    if scan.hardlink_dupes > 0 {
+        println!("  • Hardlink-Duplikate übersprungen:  {}", scan.hardlink_dupes);
     }
     if scan.cloud_skipped > 0 {
         println!("  • Cloud-Platzhalter übersprungen:   {}", scan.cloud_skipped);
@@ -1225,6 +1355,77 @@ mod tests {
         );
         // Ohne Engine-Ordner kein UE-Doppelordner-Sprung
         assert_eq!(game(r"E:\Games\Spiel\Spiel", None), Some(p(r"E:\Games\Spiel\Spiel")));
+    }
+
+    #[test]
+    fn game_root_content_dir() {
+        // MS-Store/XboxGames-artig ohne Marker
+        assert_eq!(game(r"E:\Games\Spiel\Content", None), Some(p(r"E:\Games\Spiel")));
+        assert_eq!(game(r"E:\Games\Spiel\Content\bin", None), Some(p(r"E:\Games\Spiel")));
+    }
+
+    /// Temporärer Ordner, der beim Drop gelöscht wird.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir()
+                .join(format!("ntfs-unthrottle-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+
+        fn file(&self, rel: &str) -> PathBuf {
+            let f = self.0.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"x").unwrap();
+            f
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn build(path: &Path, root: &Path) -> bool {
+        in_build_dir(path, root, &mut HashMap::new())
+    }
+
+    #[test]
+    fn build_dir_generic_needs_project_marker() {
+        let t = TempDir::new("marker");
+        // Echtes Projekt: package.json neben dist
+        t.file(r"proj\package.json");
+        let js = t.file(r"proj\dist\a.js");
+        assert!(build(&js, &t.0));
+        // Spielordner ohne Marker: dist/build zählen nicht
+        let pak = t.file(r"Games\Titel\dist\a.pak");
+        assert!(!build(&pak, &t.0));
+        let bin = t.file(r"Games\Titel\build\data\x.bin");
+        assert!(!build(&bin, &t.0));
+        // .sln-Marker (Endung, Groß-/Kleinschreibung egal)
+        t.file(r"vs\Loesung.SLN");
+        assert!(build(&t.file(r"vs\build\out.dll"), &t.0));
+        // target nur mit Cargo.toml, nicht mit package.json
+        t.file(r"rs\Cargo.toml");
+        assert!(build(&t.file(r"rs\target\debug\x.rlib"), &t.0));
+        t.file(r"web\package.json");
+        assert!(!build(&t.file(r"web\target\x"), &t.0));
+        // Spezifische Namen ohne Marker
+        assert!(build(&t.file(r"Games\Titel\node_modules\m\i.js"), &t.0));
+    }
+
+    #[test]
+    fn build_dir_ignores_folders_above_scan_root() {
+        let t = TempDir::new("above");
+        let f = t.file(r"node_modules\Spiele\Titel\a.pak");
+        // Scan-Root liegt UNTER node_modules → nicht als Build-Ordner werten
+        assert!(!build(&f, &t.0.join(r"node_modules\Spiele")));
+        // Scan-Root ist der Build-Ordner selbst → zählt
+        assert!(build(&f, &t.0.join("node_modules")));
     }
 
     #[test]
