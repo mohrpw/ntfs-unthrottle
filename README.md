@@ -79,9 +79,33 @@ werden **unabhängig von Größe und Quote** immer entpackt:
 - **Alles in Build-/Tooling-Ordnern** (Grund `Build-Ordner`): `node_modules`, `.git`,
   `target`, `obj`, `.vs`, `__pycache__`, `.venv`/`venv`, `.gradle`, `.next`, `build`,
   `dist`, `.cargo`, `.nuget`, `.m2`, … – viele kleine, ständig neu geschriebene Dateien.
+- **WOF in DirectStorage-Spielen auf NVMe** (Grund `DirectStorage`): Liegt im Spielordner
+  `dstorage.dll`/`dstoragecore.dll` und ist das Volume eine NVMe-SSD, werden die WOF-Dateien
+  des Spiels entpackt – WOF verhindert dort den BypassIO-Pfad (Windows 11) und bremst die
+  Dekompression. Ohne `--recommended` gibt es dafür nur einen Hinweis.
 
 Archive, Videos, Backups und andere gut komprimierte, selten geschriebene Daten
 behalten ihre Platzersparnis.
+
+### Speichermedium und DirectStorage
+
+Pro Scan-Pfad zeigt der Scan den Datenträger (`NVMe-SSD`, `SATA-SSD`, `HDD`, …).
+
+- **HDD / SATA-SSD:** WOF (vor allem XPRESS4K/8K) kann Ladezeiten sogar verkürzen, weil
+  weniger Daten gelesen werden. Keine Meldung.
+- **NVMe-SSD:** Die Dekompression kann langsamer sein als die Rohleserate. Bleiben auf einem
+  NVMe-Volume mehr als 1 GiB in `LZX`/`XPRESS16K`, nennt ein `ℹ`-Hinweis die größten Ordner –
+  entpackt wird nichts.
+- **DirectStorage:** Erkannt über die mitgelieferten DLLs. Der Spielordner wird aus dem
+  DLL-Pfad abgeleitet (Steam/Xbox/Epic/GOG/EA/Ubisoft-Bibliotheken, Unreal- und
+  Unity-Layouts), sodass bei `E:\Games` nur das betroffene Spiel zählt. Gilt nur auf NVMe;
+  ohne `--recommended` erscheint eine `⚠`-Meldung, mit `--recommended` werden die Dateien
+  entpackt.
+
+Grenzen: WOF-Dateien unter `--min-size` bleiben außen vor (sonst müsste jede kleine Datei
+geöffnet werden). Mit `--no-wof` oder wenn der DLL-Ordner per `-x` ausgeschlossen ist, greift
+die Erkennung nicht. Überlappende Scan-Pfade (`E:\Games E:\Games\Spiel`) werden
+zusammengefasst und nur einmal gescannt.
 
 ```powershell
 ntfs-unthrottle E:\ --recommended          # ansehen

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::os::windows::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -16,8 +16,9 @@ use walkdir::WalkDir;
 use ntfs_unthrottle::{
     compressed_ancestors, describe_error, display_path, fragment_count, physical_size,
     remove_compression, remove_ntfs_compression, volume_info, wof_algorithm, CompressionKind,
-    VolumeInfo,
+    VolumeInfo, WofAlgorithm,
 };
+use ntfs_unthrottle::tune::{device_info, DeviceInfo};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_OFFLINE,
     FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
@@ -114,7 +115,8 @@ struct Cli {
     all: bool,
 
     /// Empfohlene Auswahl: wie Standard, zusätzlich immer VM-Images, Datenbanken,
-    /// unfertige Downloads sowie alles in Build-Ordnern (node_modules, target, .git, …)
+    /// unfertige Downloads, alles in Build-Ordnern (node_modules, target, .git, …)
+    /// sowie WOF-Dateien in DirectStorage-Spielen auf NVMe
     #[arg(long, visible_alias = "recommend")]
     recommended: bool,
 
@@ -259,6 +261,7 @@ enum Reason {
     LowSavings,
     WriteHeavy,
     BuildDir,
+    DirectStorage,
     Forced,
 }
 
@@ -269,6 +272,7 @@ impl Reason {
             Reason::LowSavings => "kaum Ersparnis",
             Reason::WriteHeavy => "Schreiblast",
             Reason::BuildDir => "Build-Ordner",
+            Reason::DirectStorage => "DirectStorage",
             Reason::Forced => "--all",
         }
     }
@@ -302,6 +306,297 @@ struct Scan {
     kept_files: u64,
     kept_bytes_saved: u64,
     small_compressed: u64,
+    /// Ordner mit `dstorage.dll`/`dstoragecore.dll` (Scan-Root-Index, Ordner).
+    ds_dll_dirs: Vec<(usize, PathBuf)>,
+    /// Behaltene WOF-Dateien (≥ --min-size) für die Speichermedium-Regeln.
+    /// `reason` ist nur ein Platzhalter – gesetzt wird er erst beim Verschieben.
+    kept_wof: Vec<Candidate>,
+}
+
+/// Volume und Datenträger eines Scan-Roots – einmal ermittelt.
+#[derive(Default)]
+struct RootInfo {
+    vol: Option<VolumeInfo>,
+    dev: Option<DeviceInfo>,
+}
+
+impl RootInfo {
+    fn new(root: &Path) -> Self {
+        // device_info braucht die Volume-Wurzel bzw. den Mount-Punkt –
+        // auf einem Unterordner (E:\Games) schlüge es still fehl.
+        let vol = volume_info(root).ok();
+        let dev = vol.as_ref().and_then(|v| device_info(&v.root).ok());
+        Self { vol, dev }
+    }
+
+    fn vol_root(&self) -> Option<&Path> {
+        self.vol.as_ref().map(|v| v.root.as_path())
+    }
+
+    /// Nur echtes NVMe – RAID, Speicherplätze, USB-Gehäuse zählen nicht (kein BypassIO).
+    fn is_nvme(&self) -> bool {
+        self.dev.as_ref().is_some_and(|d| d.bus == Some("NVMe"))
+    }
+}
+
+// --- Pfadvergleiche (NTFS ist case-insensitiv) ------------------------------
+
+/// Komponentenname normiert (Unicode-Kleinschreibung, damit auch `Übung` = `übung`).
+fn fold(s: &std::ffi::OsStr) -> String {
+    s.to_string_lossy().to_lowercase()
+}
+
+/// Pfad als normierte Komponentenliste. `\\?\C:\x` und `C:\x` ergeben dasselbe.
+fn norm(p: &Path) -> Vec<String> {
+    p.components()
+        .filter_map(|c| match c {
+            Component::Prefix(pre) => Some(match pre.kind() {
+                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                    format!("{}:", char::from(d).to_ascii_lowercase())
+                }
+                Prefix::UNC(s, sh) | Prefix::VerbatimUNC(s, sh) => {
+                    format!(r"\\{}\{}", fold(s), fold(sh))
+                }
+                _ => fold(pre.as_os_str()),
+            }),
+            Component::Normal(n) => Some(fold(n)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Liegt `path` in `base` (oder ist es selbst)? Vergleich je Komponente,
+/// also `SpielAB` liegt nicht in `SpielA`.
+fn under(path: &Path, base: &Path) -> bool {
+    let (p, b) = (norm(path), norm(base));
+    p.len() >= b.len() && p[..b.len()] == b[..]
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    norm(a) == norm(b)
+}
+
+/// Vergleicht einen Komponentennamen mit einem bereits kleingeschriebenen Namen.
+fn comp_eq(a: &std::ffi::OsStr, lower: &str) -> bool {
+    fold(a) == lower
+}
+
+/// Entfernt Pfade, die in einem anderen (oder demselben) Pfad enthalten sind.
+/// Liefert die behaltenen und die verworfenen Pfade (mit dem enthaltenden Pfad).
+fn dedup_roots(mut roots: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
+    roots.sort_by_key(|p| p.components().count());
+    let mut kept: Vec<PathBuf> = Vec::new();
+    let mut dropped = Vec::new();
+    for r in roots {
+        match kept.iter().find(|k| under(&r, k)) {
+            Some(k) => dropped.push((r, k.clone())),
+            None => kept.push(r),
+        }
+    }
+    (kept, dropped)
+}
+
+// --- DirectStorage-Erkennung -----------------------------------------------
+
+/// Spiele müssen DirectStorage selbst mitbringen – die Namen sind fest.
+const DS_DLLS: &[&str] = &["dstorage.dll", "dstoragecore.dll"];
+
+/// Ordner von Spielbibliotheken (kleingeschrieben); der Ordner danach ist das Spiel.
+const LIBRARY_MARKERS: &[&[&str]] = &[
+    &["steamapps", "common"],
+    &["xboxgames"],
+    &["epic games"],
+    &["gog games"],
+    &["gog galaxy", "games"],
+    &["ea games"],
+    &["ubisoft game launcher", "games"],
+];
+
+/// Engine-/Binär-Unterordner, über die vom DLL-Ordner zum Spiel-Root aufgestiegen wird.
+const ENGINE_DIRS: &[&str] = &[
+    "binaries", "win64", "win32", "wingdk", "x64", "x86", "x86_64", "arm64", "bin", "bin64",
+    "shipping", "retail", "windows", "windowsnoeditor", "redist", "thirdparty", "directstorage",
+    "engine", "plugins",
+];
+
+/// Volume-Wurzel oder Mount-Punkt erreicht?
+fn is_vol_root(cur: &Path, vol_root: Option<&Path>) -> bool {
+    cur.file_name().is_none() || vol_root.is_some_and(|vr| same_path(cur, vr))
+}
+
+/// Endet `p` mit genau diesen (kleingeschriebenen) Komponenten?
+fn ends_with_names(p: &Path, names: &[&str]) -> bool {
+    let comps: Vec<_> = p
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    comps.len() >= names.len()
+        && comps[comps.len() - names.len()..].iter().zip(names).all(|(a, b)| comp_eq(a, b))
+}
+
+/// Leitet aus dem Ordner einer DirectStorage-DLL den Spiel-Ordner ab – reine
+/// Pfadlogik. `None`, wenn die DLL direkt in einer Volume-Wurzel liegt.
+fn ds_game_root(dll_dir: &Path, vol_root: Option<&Path>) -> Option<PathBuf> {
+    if is_vol_root(dll_dir, vol_root) {
+        return None;
+    }
+    // 1. Bekannte Bibliothek: erster Ordner nach dem Marker.
+    for a in dll_dir.ancestors() {
+        if is_vol_root(a, vol_root) {
+            break;
+        }
+        let Some(parent) = a.parent() else { break };
+        if LIBRARY_MARKERS.iter().any(|m| ends_with_names(parent, m)) {
+            return Some(a.to_path_buf());
+        }
+    }
+    // 2. Über Engine-Ordner hochsteigen.
+    let mut cur = dll_dir;
+    let mut last: Option<String> = None;
+    while !is_vol_root(cur, vol_root) {
+        let Some(name) = cur.file_name().map(fold) else { break };
+        let unity_data = last.as_deref() == Some("plugins") && name.ends_with("_data");
+        if !ENGINE_DIRS.contains(&name.as_str()) && !unity_data {
+            break;
+        }
+        let Some(parent) = cur.parent() else { break };
+        cur = parent;
+        last = Some(name);
+    }
+    // UE: Spiel\Spiel\Binaries\Win64 → Spiel (umfasst auch Spiel\Engine).
+    if last.is_some() && !is_vol_root(cur, vol_root) {
+        if let (Some(name), Some(parent)) = (cur.file_name(), cur.parent()) {
+            if !is_vol_root(parent, vol_root)
+                && parent.file_name().is_some_and(|pn| fold(pn) == fold(name))
+            {
+                cur = parent;
+            }
+        }
+    }
+    // 3. Nie ein ganzes Volume markieren.
+    if is_vol_root(cur, vol_root) {
+        return Some(dll_dir.to_path_buf());
+    }
+    Some(cur.to_path_buf())
+}
+
+/// Ergebnisse der Speichermedium-Regeln für den Report.
+#[derive(Default)]
+struct StorageNotes {
+    /// Ohne --recommended: (Spiel-Root, Dateien, Bytes logisch), die komprimiert bleiben.
+    ds_kept: Vec<(PathBuf, u64, u64)>,
+    /// Mit --recommended: (Spiel-Root, Dateien), die zum Entpacken vorgemerkt wurden.
+    ds_moved: Vec<(PathBuf, u64)>,
+    /// NVMe-Hinweis je Volume.
+    nvme_heavy: Vec<NvmeHeavy>,
+}
+
+/// Viel LZX/XPRESS16K auf einem NVMe-Volume (ohne DirectStorage-Treffer).
+struct NvmeHeavy {
+    vol: PathBuf,
+    total: u64,
+    /// Bis zu 3 größte Ordner (voller Pfad) mit Bytes.
+    dirs: Vec<(PathBuf, u64)>,
+}
+
+impl StorageNotes {
+    fn any_hint(&self) -> bool {
+        !self.ds_kept.is_empty() || !self.nvme_heavy.is_empty()
+    }
+}
+
+/// Ab so viel LZX/XPRESS16K pro NVMe-Volume gibt es einen Hinweis.
+const NVME_HEAVY_WOF_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Ordner für den NVMe-Hinweis: erste Ebene unterhalb des Scan-Roots,
+/// bzw. der Scan-Root selbst, wenn die Datei direkt darin liegt.
+fn group_dir(root: &Path, path: &Path) -> PathBuf {
+    let rel = path.strip_prefix(root).unwrap_or(Path::new(""));
+    match rel.parent() {
+        Some(p) if !p.as_os_str().is_empty() => match rel.components().next() {
+            Some(c) => root.join(c),
+            None => root.to_path_buf(),
+        },
+        _ => root.to_path_buf(),
+    }
+}
+
+/// Wendet die DirectStorage-/NVMe-Regeln auf die behaltenen WOF-Dateien an.
+/// Muss vor `check_free_space` laufen, damit verschobene Dateien mitzählen.
+fn apply_storage_rules(cli: &Cli, scan: &mut Scan, roots: &[PathBuf], infos: &[RootInfo]) -> StorageNotes {
+    let mut notes = StorageNotes::default();
+
+    // Spiel-Roots aller Scan-Pfade, äußere gewinnen.
+    let found: Vec<PathBuf> = scan
+        .ds_dll_dirs
+        .iter()
+        .filter_map(|(i, dir)| ds_game_root(dir, infos[*i].vol_root()))
+        .collect();
+    let (games, _) = dedup_roots(found);
+    let games_norm: Vec<Vec<String>> = games.iter().map(|g| norm(g)).collect();
+    let game_of = |p: &Path| {
+        let n = norm(p);
+        games_norm.iter().position(|g| n.len() >= g.len() && n[..g.len()] == g[..])
+    };
+
+    let mut per_game = vec![(0u64, 0u64); games.len()];
+    // Volume (normiert) → (Volume-Pfad, Summe, Bytes je Ordner)
+    type Heavy = (PathBuf, u64, BTreeMap<PathBuf, u64>);
+    let mut heavy: BTreeMap<Vec<String>, Heavy> = BTreeMap::new();
+    let mut moved = false;
+
+    for mut f in std::mem::take(&mut scan.kept_wof) {
+        let info = &infos[f.root];
+        if !info.is_nvme() {
+            continue;
+        }
+        if let Some(g) = game_of(&f.path) {
+            per_game[g].0 += 1;
+            per_game[g].1 += f.logical;
+            if cli.recommended {
+                scan.kept_files = scan.kept_files.saturating_sub(1);
+                scan.kept_bytes_saved =
+                    scan.kept_bytes_saved.saturating_sub(f.logical.saturating_sub(f.physical));
+                f.reason = Reason::DirectStorage;
+                scan.files.push(f);
+                moved = true;
+            }
+            continue;
+        }
+        if matches!(f.kind, CompressionKind::Wof(WofAlgorithm::Lzx | WofAlgorithm::Xpress16K)) {
+            let Some(vol) = info.vol_root() else { continue };
+            let e = heavy.entry(norm(vol)).or_insert_with(|| (vol.to_path_buf(), 0, BTreeMap::new()));
+            e.1 += f.logical;
+            *e.2.entry(group_dir(&roots[f.root], &f.path)).or_default() += f.logical;
+        }
+    }
+
+    for (g, (n, bytes)) in games.into_iter().zip(per_game) {
+        if n == 0 {
+            continue;
+        }
+        if cli.recommended {
+            notes.ds_moved.push((g, n));
+        } else {
+            notes.ds_kept.push((g, n, bytes));
+        }
+    }
+    for (_, (vol, total, dirs)) in heavy {
+        if total <= NVME_HEAVY_WOF_BYTES {
+            continue;
+        }
+        let mut dirs: Vec<(PathBuf, u64)> = dirs.into_iter().collect();
+        dirs.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+        dirs.truncate(3);
+        notes.nvme_heavy.push(NvmeHeavy { vol, total, dirs });
+    }
+    if moved {
+        scan.files.sort_by_key(|f| std::cmp::Reverse(f.logical));
+    }
+    notes
 }
 
 fn ratio(physical: u64, logical: u64) -> f64 {
@@ -352,12 +647,24 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     if roots.is_empty() {
         return Err(io::Error::other("Keine bearbeitbaren Pfade übrig."));
     }
+    // Überlappende Pfade nur einmal scannen – sonst doppelte Kandidaten,
+    // doppelter Platzbedarf und doppeltes Entpacken.
+    let (roots, dropped) = dedup_roots(roots);
+    for (inner, outer) in &dropped {
+        println!(
+            "{} {} ist in {} enthalten – wird nicht doppelt gescannt.",
+            style("ℹ").blue().bold(),
+            display_path(inner),
+            display_path(outer)
+        );
+    }
+    let infos: Vec<RootInfo> = roots.iter().map(|r| RootInfo::new(r)).collect();
 
     // --- Phase 1: Scan ----------------------------------------------------
     println!("{} Scanne {} Pfad(e)", style("[1/3]").bold().cyan(), roots.len());
-    for root in &roots {
+    for (root, info) in roots.iter().zip(&infos) {
         println!("      {}", style(display_path(root)).underlined());
-        report_volume(root);
+        report_volume(info);
     }
 
     let started = Instant::now();
@@ -377,7 +684,8 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     scan.files.sort_by_key(|f| std::cmp::Reverse(f.logical));
 
     // --- Phase 2: Auswertung ----------------------------------------------
-    print_report(cli, &scan, started.elapsed());
+    let notes = apply_storage_rules(cli, &mut scan, &roots, &infos);
+    print_report(cli, &scan, &notes, started.elapsed());
 
     let ancestors: Vec<PathBuf> = {
         let mut v: Vec<PathBuf> = roots.iter().flat_map(|r| compressed_ancestors(r)).collect();
@@ -398,8 +706,9 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     let dirs_todo = if cli.keep_dir_flags { 0 } else { scan.dirs.len() };
     if dirs_todo == 0 && scan.files.is_empty() {
         println!(
-            "\n{} Keine kontraproduktive Komprimierung gefunden.",
-            style("✔").green().bold()
+            "\n{} Keine kontraproduktive Komprimierung gefunden{}.",
+            style("✔").green().bold(),
+            if notes.any_hint() { " (Hinweise oben beachten)" } else { "" }
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -572,6 +881,15 @@ fn scan_tree(cli: &Cli, root_idx: usize, root: &Path, excludes: &Excludes, scan:
         }
 
         let path = entry.path();
+        // DirectStorage-DLLs sind klein – deshalb vor dem Größenfilter. Kein Syscall:
+        // nur der Name. Ausgewertet wird nach dem Walk (Reihenfolge ist beliebig).
+        if let (Some(name), Some(parent)) = (path.file_name(), path.parent()) {
+            if DS_DLLS.iter().any(|d| comp_eq(name, d))
+                && scan.ds_dll_dirs.last().is_none_or(|(_, p)| p != parent)
+            {
+                scan.ds_dll_dirs.push((root_idx, parent.to_path_buf()));
+            }
+        }
         let write_heavy = cli.recommended && has_ext(path, WRITE_HEAVY_EXTS);
         let build_dir = cli.recommended && !write_heavy && in_build_dir(path);
 
@@ -642,25 +960,83 @@ fn scan_tree(cli: &Cli, root_idx: usize, root: &Path, excludes: &Excludes, scan:
             None => {
                 scan.kept_files += 1;
                 scan.kept_bytes_saved += logical.saturating_sub(physical);
+                // WOF unter --min-size bleibt bewusst außen vor: sonst müsste jede
+                // kleine Datei für FSCTL_GET_EXTERNAL_BACKING geöffnet werden.
+                if let CompressionKind::Wof(_) = kind {
+                    scan.kept_wof.push(Candidate {
+                        root: root_idx,
+                        path: path.to_path_buf(),
+                        logical,
+                        physical,
+                        kind,
+                        reason: Reason::DirectStorage,
+                        fragments: None,
+                    });
+                }
             }
         }
     }
     scan.excluded.extend(excluded.into_inner());
 }
 
-fn report_volume(root: &Path) {
-    match volume_info(root) {
-        Ok(v) if !v.supports_compression => println!(
+fn report_volume(info: &RootInfo) {
+    match &info.vol {
+        Some(v) if !v.supports_compression => println!(
             "      {} Dateisystem {} unterstützt keine Datei-Komprimierung – vermutlich nichts zu tun.",
             style("ℹ").blue(),
             v.fs_name
         ),
-        Ok(_) => {}
-        Err(e) => println!("      {} Volume-Info nicht lesbar: {e}", style("⚠").yellow()),
+        Some(_) => {}
+        None => println!("      {} Volume-Info nicht lesbar", style("⚠").yellow()),
+    }
+    if let Some(d) = &info.dev {
+        let kind = match d.seek_penalty {
+            Some(true) => "HDD",
+            Some(false) => "SSD",
+            None => "Datenträger",
+        };
+        let bus = d.bus.map(|b| format!("{b}-")).unwrap_or_default();
+        let product = d.product.as_deref().map(|p| format!(" ({p})")).unwrap_or_default();
+        println!("      {}", style(format!("Datenträger: {bus}{kind}{product}")).dim());
     }
 }
 
-fn print_report(cli: &Cli, scan: &Scan, took: Duration) {
+/// ⚠/ℹ-Blöcke der Speichermedium-Regeln (nach der Übersicht).
+fn print_storage_notes(notes: &StorageNotes) {
+    for (g, n, bytes) in &notes.ds_kept {
+        println!(
+            "\n  {} DirectStorage erkannt: {}",
+            style("⚠").yellow().bold(),
+            style(display_path(g)).bold()
+        );
+        println!(
+            "      {} WOF-Datei(en) ({}) bleiben komprimiert. Auf NVMe verhindert WOF den",
+            n,
+            format_size(*bytes, BINARY)
+        );
+        println!("      BypassIO-Pfad (Windows 11) und bremst die Dekompression.");
+        println!(
+            "      Entpacken: {}  (alles im Spiel: ntfs-unthrottle \"{}\" --all --fix)",
+            style("--recommended").yellow(),
+            display_path(g)
+        );
+    }
+    for NvmeHeavy { vol, total, dirs } in &notes.nvme_heavy {
+        println!(
+            "\n  {} NVMe {}: {} in LZX/XPRESS16K-Dateien bleiben komprimiert. Auf schnellen",
+            style("ℹ").blue().bold(),
+            display_path(vol),
+            format_size(*total, BINARY)
+        );
+        println!("      NVMe-SSDs kann die Dekompression langsamer sein als die Rohleserate.");
+        println!("      Wem Ladezeit wichtiger ist als Platz: ntfs-unthrottle \"<Ordner>\" --all --fix");
+        for (d, b) in dirs {
+            println!("        {:>10}  {}", format_size(*b, BINARY), display_path(d));
+        }
+    }
+}
+
+fn print_report(cli: &Cli, scan: &Scan, notes: &StorageNotes, took: Duration) {
     let logical: u64 = scan.files.iter().map(|f| f.logical).sum();
     let physical: u64 = scan.files.iter().map(|f| f.physical).sum();
 
@@ -694,6 +1070,15 @@ fn print_report(cli: &Cli, scan: &Scan, took: Duration) {
             format_size(scan.kept_bytes_saved, BINARY)
         );
     }
+    // Bewusst außerhalb von `kept_files > 0`: Hat --recommended alle WOF-Dateien
+    // verschoben, ist kept_files 0 – die Zeile soll trotzdem erscheinen.
+    for (g, n) in &notes.ds_moved {
+        println!(
+            "  • DirectStorage erkannt:            {} – {} WOF-Datei(en) werden entpackt",
+            display_path(g),
+            n
+        );
+    }
     if scan.small_compressed > 0 {
         println!(
             "  • Komprimiert, aber < {} MiB:        {} (ignoriert)",
@@ -720,6 +1105,7 @@ fn print_report(cli: &Cli, scan: &Scan, took: Duration) {
     if scan.errors > 0 {
         println!("  • Nicht lesbare Pfade:              {}", style(scan.errors).dim());
     }
+    print_storage_notes(notes);
 
     if !scan.files.is_empty() {
         let shown = if cli.verbose { scan.files.len() } else { 10 };
@@ -792,4 +1178,143 @@ fn confirm(prompt: &str) -> io::Result<bool> {
 
 fn file_name(p: &Path) -> String {
     p.file_name().unwrap_or_default().to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    fn game(dll_dir: &str, vol: Option<&str>) -> Option<PathBuf> {
+        ds_game_root(Path::new(dll_dir), vol.map(Path::new))
+    }
+
+    #[test]
+    fn game_root_steam_marker() {
+        assert_eq!(
+            game(r"E:\SteamLibrary\steamapps\common\Spiel\Engine\Binaries\ThirdParty\Win64", None),
+            Some(p(r"E:\SteamLibrary\steamapps\common\Spiel"))
+        );
+        // Groß-/Kleinschreibung egal
+        assert_eq!(
+            game(r"E:\SteamApps\Common\Spiel\bin", None),
+            Some(p(r"E:\SteamApps\Common\Spiel"))
+        );
+    }
+
+    #[test]
+    fn game_root_other_launchers() {
+        assert_eq!(game(r"D:\EA Games\Spiel\Data\Win64", None), Some(p(r"D:\EA Games\Spiel")));
+        assert_eq!(
+            game(r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\games\Spiel\bin", None),
+            Some(p(r"C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\games\Spiel"))
+        );
+        assert_eq!(game(r"D:\GOG Galaxy\Games\Spiel", None), Some(p(r"D:\GOG Galaxy\Games\Spiel")));
+        assert_eq!(game(r"D:\XboxGames\Spiel\Content", None), Some(p(r"D:\XboxGames\Spiel")));
+    }
+
+    #[test]
+    fn game_root_unreal() {
+        assert_eq!(game(r"E:\Games\Spiel\Spiel\Binaries\Win64", None), Some(p(r"E:\Games\Spiel")));
+        assert_eq!(
+            game(r"E:\Games\Spiel\Engine\Binaries\ThirdParty\DirectStorage\Win64", None),
+            Some(p(r"E:\Games\Spiel"))
+        );
+        // Ohne Engine-Ordner kein UE-Doppelordner-Sprung
+        assert_eq!(game(r"E:\Games\Spiel\Spiel", None), Some(p(r"E:\Games\Spiel\Spiel")));
+    }
+
+    #[test]
+    fn game_root_unity() {
+        assert_eq!(
+            game(r"E:\Games\Spiel\Spiel_Data\Plugins\x86_64", None),
+            Some(p(r"E:\Games\Spiel"))
+        );
+        // _Data nur direkt über Plugins
+        assert_eq!(game(r"E:\Games\Spiel\Foo_Data\bin", None), Some(p(r"E:\Games\Spiel\Foo_Data")));
+    }
+
+    #[test]
+    fn game_root_volume_guards() {
+        // DLL direkt in der Wurzel → nichts markieren
+        assert_eq!(game(r"E:\", None), None);
+        // Aufstieg bis zur Wurzel → DLL-Ordner selbst
+        assert_eq!(game(r"E:\Binaries", None), Some(p(r"E:\Binaries")));
+        // Mount-Punkt ohne Laufwerksbuchstaben
+        assert_eq!(game(r"C:\Games\Binaries", Some(r"C:\Games\")), Some(p(r"C:\Games\Binaries")));
+        assert_eq!(game(r"C:\Games", Some(r"C:\Games")), None);
+        // Verbatim-Präfix vs. Volume-Wurzel ohne Präfix
+        assert_eq!(
+            game(r"\\?\C:\Games\Binaries", Some(r"C:\Games\")),
+            Some(p(r"\\?\C:\Games\Binaries"))
+        );
+        assert_eq!(
+            game(r"\\?\E:\Games\Spiel\Binaries\Win64", Some(r"E:\")),
+            Some(p(r"\\?\E:\Games\Spiel"))
+        );
+    }
+
+    #[test]
+    fn game_root_marker_edge_cases() {
+        // DLL direkt im Marker-Ordner → Regel 2, Ordner selbst
+        assert_eq!(game(r"E:\steamapps\common", None), Some(p(r"E:\steamapps\common")));
+        // Kein Substring-Treffer
+        assert_eq!(
+            game(r"E:\backup_steamapps_common_old\Spiel\bin", None),
+            Some(p(r"E:\backup_steamapps_common_old\Spiel"))
+        );
+        assert_eq!(
+            game(r"E:\My SteamApps Backup\common\Spiel\bin", None),
+            Some(p(r"E:\My SteamApps Backup\common\Spiel"))
+        );
+    }
+
+    #[test]
+    fn under_is_component_wise_and_case_insensitive() {
+        assert!(under(Path::new(r"E:\Games\SpielA\x.bin"), Path::new(r"e:\games\spiela")));
+        assert!(under(Path::new(r"E:\Spiele\Übung\a"), Path::new(r"e:\spiele\übung")));
+        assert!(under(Path::new(r"\\?\E:\Games\SpielA"), Path::new(r"E:\Games")));
+        assert!(!under(Path::new(r"E:\Games\SpielAB\x"), Path::new(r"E:\Games\SpielA")));
+        assert!(!under(Path::new(r"E:\Games"), Path::new(r"E:\Games\SpielA")));
+        assert!(!under(Path::new(r"F:\Games\SpielA"), Path::new(r"E:\Games")));
+    }
+
+    #[test]
+    fn dedup_roots_drops_contained_paths() {
+        let (kept, dropped) = dedup_roots(vec![p(r"E:\Games\SpielA"), p(r"E:\Games")]);
+        assert_eq!(kept, vec![p(r"E:\Games")]);
+        assert_eq!(dropped, vec![(p(r"E:\Games\SpielA"), p(r"E:\Games"))]);
+
+        let (kept, _) = dedup_roots(vec![p(r"E:\Games"), p(r"E:\Games")]);
+        assert_eq!(kept, vec![p(r"E:\Games")]);
+
+        let (kept, _) = dedup_roots(vec![p(r"E:\games"), p(r"E:\Games\x")]);
+        assert_eq!(kept, vec![p(r"E:\games")]);
+
+        let (kept, _) = dedup_roots(vec![p(r"E:\Games\SpielA"), p(r"E:\Games\SpielAB")]);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn group_dir_uses_full_path() {
+        assert_eq!(
+            group_dir(Path::new(r"E:\Games"), Path::new(r"E:\Games\SpielB\data\a.bin")),
+            p(r"E:\Games\SpielB")
+        );
+        // Datei direkt im Scan-Root → Scan-Root selbst
+        assert_eq!(
+            group_dir(Path::new(r"E:\Games\SpielB"), Path::new(r"E:\Games\SpielB\a.bin")),
+            p(r"E:\Games\SpielB")
+        );
+        // Scan-Root ist die Datei selbst
+        assert_eq!(group_dir(Path::new(r"E:\a.bin"), Path::new(r"E:\a.bin")), p(r"E:\a.bin"));
+        // Zwei Scan-Roots mit gleichnamigem Unterordner bleiben getrennt
+        assert_ne!(
+            group_dir(Path::new(r"E:\Games"), Path::new(r"E:\Games\Shared\a")),
+            group_dir(Path::new(r"E:\Backup"), Path::new(r"E:\Backup\Shared\a"))
+        );
+    }
 }
