@@ -1,6 +1,6 @@
 [package]
 name = "ntfs-unthrottle"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.83"
 description = "Detects and removes counterproductive NTFS/WOF compression that throttles Windows file I/O."
@@ -16,22 +16,36 @@ path = "src/lib.rs"
 [[bin]]
 name = "ntfs-unthrottle"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# Volume/drive diagnostics (`ntfs_unthrottle::tune`): registry, BypassIO, TRIM, MFT.
+tune = ["windows-sys/Win32_System_Registry", "windows-sys/Win32_Globalization"]
+# The command-line tool. Library users can opt out with `default-features = false`.
+cli = [
+    "tune",
+    "windows-sys/Win32_Globalization",
+    "dep:clap",
+    "dep:console",
+    "dep:humansize",
+    "dep:indicatif",
+    "dep:walkdir",
+]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-console = "0.15"
-humansize = "2.1"
-indicatif = "0.17"
-walkdir = "2.5"
+clap = { version = "4.5", features = ["derive"], optional = true }
+console = { version = "0.15", optional = true }
+humansize = { version = "2.1", optional = true }
+indicatif = { version = "0.17", optional = true }
+walkdir = { version = "2.5", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
-    "Win32_Globalization",
     "Win32_System_Ioctl",
-    "Win32_System_Registry",
 ] }
 
 [profile.release]
