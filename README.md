@@ -3,9 +3,9 @@
 Viele Windows-Laufwerke oder Ordner nutzen unbemerkt transparente Komprimierung –
 entweder klassisch per NTFS (LZNT1, blaue Doppelpfeile im Explorer) oder per
 **Windows Overlay Filter (WOF / CompactOS)**, der *gar kein* sichtbares Attribut setzt.
-Bei großen, bereits gepackten oder verschlüsselten Dateien (`.xci`, `.nsp`, `.nca`,
-Archive, Videos, Images) spart das praktisch keinen Platz, kostet aber CPU beim
-Schreiben und bremst Entpack-/Kopiervorgänge aus – ohne Fehlermeldung.
+Bei großen, bereits gepackten oder verschlüsselten Dateien (Archive, Videos,
+Disk-Images wie `.iso`, Asset-Container wie `.pak`) spart das praktisch keinen Platz,
+kostet aber CPU beim Schreiben und bremst Entpack-/Kopiervorgänge aus – ohne Fehlermeldung.
 
 `ntfs-unthrottle` spürt solche kontraproduktiven Komprimierungen auf und entfernt sie
 direkt über die Win32-API (`DeviceIoControl`), ohne `compact.exe`.
@@ -13,18 +13,18 @@ direkt über die Win32-API (`DeviceIoControl`), ohne `compact.exe`.
 ## Praxis-Benchmark (Entstehungsmessung, Stand `v0.2.0`)
 
 `ntfs-unthrottle` entstand aus einem realen Performance-Post-Mortem beim Entpacken
-eines Switch-Containers (`Zelda.nsp`, `6,27 GB`, `3.848` Dateien) unter Windows 11 auf
-einer SATA-SSD (`Samsung 870 QVO`, NTFS). Obwohl das Laufwerks-Root `E:\` im Explorer
-unkomprimiert wirkte, trugen die Ziel-Unterordner vererbtes `FILE_ATTRIBUTE_COMPRESSED`
-(LZNT1): kaum Platzersparnis (`1,1 : 1` bis `1,2 : 1`), aber `NTFS.sys` prüfte jede
-`64-KiB`-Compression-Unit synchron beim Schreiben – selbst paralleler Rust-Code
-(`rayon`, `seek_read`, AES-NI) skalierte kaum.
+eines verschlüsselten `6,27-GB`-Binärcontainers (`3.848` Einzeldateien) unter
+Windows 11 auf einer SATA-SSD (`Samsung 870 QVO`, NTFS). Obwohl das Laufwerks-Root
+`E:\` im Explorer unkomprimiert wirkte, trugen die Ziel-Unterordner vererbtes
+`FILE_ATTRIBUTE_COMPRESSED` (LZNT1): kaum Platzersparnis (`1,1 : 1` bis `1,2 : 1`),
+aber `NTFS.sys` prüfte jede `64-KiB`-Compression-Unit synchron beim Schreiben –
+selbst paralleler Rust-Code (`rayon`, `seek_read`, AES-NI) skalierte kaum.
 
 | Messung (`E:\`, vererbte NTFS-Komprimierung → unkomprimiert) | Vorher | Nachher | Speedup |
 |---|---:|---:|---:|
-| Beobachteter NSP-Unpack (End-to-End) | `~200 s` | `~30 s` | **~6,7×** |
-| Kontrolllauf Schritt 1 (`pfs0`, `6,27 GB` Container) | `111,64 s` | `13,05 s` | **~8,6×** |
-| Kontrolllauf gesamt (`pfs0` + `nca`, `3.848` Dateien, freier SLC-Cache) | `218,67 s` | `85,74 s` | **~2,6×** |
+| Beobachteter Container-Unpack (End-to-End) | `~200 s` | `~30 s` | **~6,7×** |
+| Kontrolllauf Schritt 1 (Container-Extraktion, `6,27 GB`) | `111,64 s` | `13,05 s` | **~8,6×** |
+| Kontrolllauf gesamt (Container + Entschlüsselung von `3.848` Dateien, freier SLC-Cache) | `218,67 s` | `85,74 s` | **~2,6×** |
 
 *(Referenzwert auf unkomprimierter NVMe-SSD `C:`: `22,43–31,09 s`. Ein aktualisierter
 Benchmark für `v0.6.0` inkl. WOF/DirectStorage/BypassIO folgt.)*
@@ -59,10 +59,10 @@ Zusätzlich warnt das Tool, wenn **übergeordnete** Ordner des Scan-Pfads das Fl
 
 ```powershell
 # Analyse (Dry-Run, ändert nichts)
-ntfs-unthrottle D:\Games\Switch
+ntfs-unthrottle D:\Games\Library
 
 # Bereinigen mit Rückfrage
-ntfs-unthrottle D:\Games\Switch --fix
+ntfs-unthrottle D:\Games\Library --fix
 
 # Skript/Scheduled Task: alles ab 50 MiB, ohne Rückfrage
 ntfs-unthrottle E:\Workspace F:\ISOs --fix --yes --min-size 50
@@ -212,7 +212,7 @@ Zieldatei abschalten – solange sie 0 Byte groß ist, kostet das < 1 ms:
 ```rust
 use std::io::Write;
 
-let mut out = ntfs_unthrottle::create_uncompressed("D:/out/game.xci".as_ref())?;
+let mut out = ntfs_unthrottle::create_uncompressed("D:/out/archive.bin".as_ref())?;
 out.write_all(&data)?;
 ```
 
