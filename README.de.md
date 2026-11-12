@@ -245,7 +245,9 @@ Pfade, was Datei-I/O unabhängig von der Komprimierung bremst:
 | Last-Access-Zeitstempel | `fsutil behavior set disablelastaccess 1` |
 | TRIM bei NTFS-SSDs | `fsutil behavior set DisableDeleteNotify NTFS 0` |
 | TRIM bei ReFS-SSDs (Dev Drive) | `fsutil behavior set DisableDeleteNotify ReFS 0` |
+| ReFS Dev-Drive-Status (Vertrauenswürdigkeit) | – (Hinweis auf `fsutil devdrv trust` / `query`) |
 | BypassIO (Windows 11, NTFS): aktiv / partiell / blockiert durch `<treiber.sys>` | – (Hinweis auf `fsutil bypassIo state /v E:\` und `fltmc filters`) |
+| Windows Search Indexer (`WSearch` / Root-Attribut) | – (sanfter Hinweis auf Datenlaufwerken) |
 | Dirty-Bit | – (Hinweis auf `chkdsk E: /scan`) |
 
 Die BypassIO-Zeile nutzt `FSCTL_MANAGE_BYPASS_IO` (`FS_BPIO_OP_QUERY`, ohne
@@ -275,18 +277,21 @@ ntfs-unthrottle E:\ --optimize --fix    # anwenden (Terminal als Administrator)
 | `-y, --yes` | *aus* | Keine Sicherheitsabfrage (nur zusammen mit `--fix`) |
 | `--recommended` | *aus* | Empfohlene Auswahl (Alias `--recommend`); nicht mit `--all` kombinierbar |
 | `--all` | *aus* | Jede komprimierte Datei ab `--min-size` erfassen (Endung/Quote egal) |
+| `--only <GRUND>` | *leer* | Auswahl auf `extension`, `low-savings`, `write-heavy`, `build`, `ds`, `all` beschränken (aktiviert Erkennung automatisch; mehrfach/kommagetrennt) |
 | `--min-size <MiB>` | `16` | Mindestgröße für Dateien in MiB |
 | `--threshold <PROZENT>` | `90` | Ab dieser physischen Quote (`physisch / logisch`) gilt Komprimierung als nutzlos |
 | `--keep-dir-flags` | *aus* | Komprimierungsflag von Ordnern nicht entfernen |
+| `--clear-dirs` | *aus* | Auch unter `--only` alle gefundenen Ordner-Flags bereinigen (schließt `--keep-dir-flags` aus) |
 | `--no-wof` | *aus* | WOF-/CompactOS-Erkennung überspringen (spart ein Öffnen pro großer Datei) |
 | `--no-fragments` | *aus* | Fragmentanzahl nicht ermitteln |
+| `--json` | *aus* | Maschinenlesbares JSON auf stdout (`--fix --json` erfordert `--yes`) |
 | `--optimize` | *aus* | Volume- und Hardware-Diagnose statt Dateiscan |
 | `-v, --verbose` | *aus* | Alle Kandidaten, Ordner und Fehler im Detail auflisten |
 | `-x, --exclude <NAME\|PFAD>` | *leer* | Name (greift in jeder Tiefe) oder Pfad (Präfix) ausschließen; mehrfach angebbar |
 | `--lang <auto\|en\|de>` | `auto` | Sprache der Laufzeitausgaben (`--help` ist immer Englisch) |
 
 **Exit-Codes:** `0` nichts zu tun / alles behoben · `1` Fehler · `2` Dry-Run hat
-Kandidaten gefunden · `3` einzelne Elemente schlugen fehl.
+Kandidaten gefunden · `3` einzelne Elemente schlugen fehl · `130` durch Benutzer abgebrochen (`Strg+C`).
 
 **Ausgabesprache:** Mit `--lang auto` gilt zuerst `LC_ALL`, `LC_MESSAGES` bzw. `LANG`
 (ignoriert, wenn leer oder `C`/`POSIX`), sonst die Windows-Anzeigesprache. Deutsches
@@ -315,8 +320,9 @@ und greift auch bei direkter Angabe (`ntfs-unthrottle E:\$RECYCLE.BIN`,
 - **Auffangnetz:** Jedes Element in der Laufwerkswurzel mit `HIDDEN | SYSTEM`
 - **Freier-Platz-Check:** Prüft je Volume den Mehrbedarf (`logisch − physisch`) plus
   Sicherheitspuffer (`max(256 MiB, 1 %)`)
-- **Cloud- & Link-Schutz:** Cloud-Platzhalter (OneDrive & Co.) sowie Reparse-Points
-  (Junctions, Symlinks, Dedup) werden übersprungen
+- **Cloud-, Sparse- & Link-Schutz:** Cloud-Platzhalter (OneDrive & Co.), Sparse-Dateien
+  (`SPARSE_FILE`, damit Nullbereiche nicht unerwartet materialisiert werden) sowie Reparse-Points
+  (Junctions, Symlinks, Dedup) werden übersprungen; offene Ordner-Handles werden zusätzlich geprüft
 
 ---
 
@@ -335,28 +341,40 @@ ntfs-unthrottle = { git = "https://github.com/mohrpw/ntfs-unthrottle.git", defau
 
 | Feature | Standard | Inhalt |
 |---|---|---|
-| `cli` | ja | Das Programm `ntfs-unthrottle` (`clap`, `console`, `humansize`, `indicatif`, `walkdir`); aktiviert `tune` |
-| `tune` | über `cli` | `ntfs_unthrottle::tune` – Volume-/Laufwerksdiagnose (TRIM, BypassIO, MFT, 8.3-Namen) |
+| `cli` | ja | Das Programm `ntfs-unthrottle` (`clap`, `console`, `humansize`, `indicatif`, `serde_json`, `walkdir`); aktiviert `tune` |
+| `tune` | über `cli` | `ntfs_unthrottle::tune` – Volume-/Laufwerksdiagnose (TRIM, BypassIO, Dev Drive, MFT, 8.3-Namen, Indexer) |
 
 ```rust
+use std::fs::OpenOptions;
 use std::io::Write;
+use ntfs_unthrottle::UncompressedOpenOptions;
 
 fn main() -> std::io::Result<()> {
     ntfs_unthrottle::create_dir_all_uncompressed("D:/out/romfs")?;
-    let mut out = ntfs_unthrottle::create_uncompressed("D:/out/romfs/archive.bin")?;
+    let mut out = ntfs_unthrottle::create_uncompressed_with_size("D:/out/romfs/archive.bin", data.len() as u64)?;
     out.write_all(&data)?;
+
+    // Oder mit eigenem OpenOptions-Setup (z. B. create_new, FILE_FLAG_SEQUENTIAL_SCAN):
+    let _f = OpenOptions::new().read(true).write(true).create_new(true).open_uncompressed("D:/out/romfs/new.bin")?;
     Ok(())
 }
 ```
 
-- `create_uncompressed(path)` – legt eine Datei an (bzw. kürzt sie) und schaltet die
-  Komprimierung **nur dann** ab, wenn sie `FILE_ATTRIBUTE_COMPRESSED` geerbt hat: in normalen
-  Ordnern fällt kein zusätzlicher IOCTL an. Der Schutz ist **best-effort**: lehnt z. B. ein
-  Filtertreiber das FSCTL ab, wird die Datei trotzdem zurückgegeben; gemeldet werden nur
-  Fehler beim Öffnen/Anlegen.
+- `create_uncompressed(path)` / `create_uncompressed_with_size(path, size)` – legt eine Datei an
+  (bzw. kürzt sie), schaltet die Komprimierung **nur dann** ab, wenn sie `FILE_ATTRIBUTE_COMPRESSED`
+  geerbt hat (in normalen Ordnern fällt kein IOCTL an) und reserviert bei `_with_size` die Zielgröße
+  am Stück (`FileAllocationInfo`), um Fragmentierung unter NTFS/ReFS zu vermeiden. Beide Schutzmaßnahmen
+  sind **best-effort**: lehnt ein Dateisystem oder Filtertreiber ab (z. B. FAT32/exFAT/SMB-Quota),
+  wird die Datei trotzdem zurückgegeben; gemeldet werden nur Fehler beim Öffnen/Anlegen.
+- `UncompressedOpenOptions` (`open_uncompressed(path)` / `open_uncompressed_with_size(path, size)`) –
+  Extension-Trait für `std::fs::OpenOptions` (z. B. für `create_new(true)` oder eigene Windows-Flags)
+  mit demselben Best-Effort-Schutz gegen Komprimierung und Fragmentierung.
+- `preallocate(&file, size)` – explizite/strikte Vorallokation über `SetFileInformationByHandle`
+  (`FileAllocationInfo`; meldet Fehler, benötigt Schreibzugriff und behandelt `size == 0` sowie
+  Dateien, die bereits `>= size` groß sind, als No-op).
 - `create_dir_all_uncompressed(path)` – wie `std::fs::create_dir_all`, löscht aber das
   Komprimierungs-Flag auf jedem neu angelegten Ordner und auf dem Zielordner selbst
-  (bestehende Ordner darüber bleiben unverändert). Ebenfalls best-effort.
+  (bestehende Ordner darüber und Reparse-Points bleiben unverändert). Ebenfalls best-effort.
 - `clear_dir_compression(dir)` – löscht das Komprimierungs-Flag eines Ordners, falls gesetzt.
 - `compression_kind(path)` – `None`, `Some(Lznt1)` oder `Some(Wof(..))`, z. B. für einen
   Hinweis vorab, dass eine Eingabedatei komprimiert auf der Platte liegt.

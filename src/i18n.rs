@@ -416,11 +416,46 @@ impl Lang {
     pub fn bar_files_template(self) -> &'static str {
         match self {
             Lang::En => {
-                "  Files   [{bar:30.green/white}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}  {wide_msg:.dim}"
+                "  Files   [{bar:30.green/white}] {files_pos}/{files_len} {bytes}/{total_bytes} {smoothed_rate} ETA {smoothed_eta}  {wide_msg:.dim}"
             }
             Lang::De => {
-                "  Dateien [{bar:30.green/white}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}  {wide_msg:.dim}"
+                "  Dateien [{bar:30.green/white}] {files_pos}/{files_len} {bytes}/{total_bytes} {smoothed_rate} ETA {smoothed_eta}  {wide_msg:.dim}"
             }
+        }
+    }
+
+    pub fn json_fix_requires_yes(self) -> &'static str {
+        match self {
+            Lang::En => "--json with --fix requires --yes (no interactive prompt in JSON mode).",
+            Lang::De => "--json zusammen mit --fix erfordert --yes (keine interaktive Abfrage im JSON-Modus).",
+        }
+    }
+
+    pub fn interrupted_partial(self) -> &'static str {
+        match self {
+            Lang::En => "Interrupted by user (Ctrl+C) – partial result after current item:",
+            Lang::De => "Vom Benutzer abgebrochen (Strg+C) – Teilergebnis nach aktuellem Element:",
+        }
+    }
+
+    pub fn heavily_fragmented_header(self, n: usize) -> String {
+        match self {
+            Lang::En => format!("{n} file(s) still have many fragments (NTFS kept existing extents):"),
+            Lang::De => format!("{n} Datei(en) haben weiterhin viele Fragmente (Extents blieben verteilt):"),
+        }
+    }
+
+    pub fn heavily_fragmented_hint_contig(self, path: impl Display) -> String {
+        match self {
+            Lang::En => format!("contig.exe \"{path}\""),
+            Lang::De => format!("contig.exe \"{path}\""),
+        }
+    }
+
+    pub fn heavily_fragmented_hint_defrag(self, vol: impl Display) -> String {
+        match self {
+            Lang::En => format!("Whole volume (especially on HDD): defrag {vol} /U /V"),
+            Lang::De => format!("Ganzes Volume (besonders auf HDD): defrag {vol} /U /V"),
         }
     }
 
@@ -479,6 +514,13 @@ impl Lang {
         match self {
             Lang::En => "  (--keep-dir-flags: kept)",
             Lang::De => "  (--keep-dir-flags: bleiben)",
+        }
+    }
+
+    pub fn only_dirs_filtered_note(self, kept: usize) -> String {
+        match self {
+            Lang::En => format!("  (--only: {kept} selected; --clear-dirs clears all)"),
+            Lang::De => format!("  (--only: {kept} ausgewählt; --clear-dirs entfernt alle)"),
         }
     }
 
