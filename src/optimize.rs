@@ -14,8 +14,9 @@ use console::style;
 use humansize::{format_size, BINARY};
 
 use ntfs_unthrottle::tune::{
-    bypass_io_status, decode_oem, device_info, filesystem_reg_value, ntfs_data, refs_trim_disabled,
-    short_names_disabled_on_volume, volume_dirty, BypassIoStatus,
+    bypass_io_status, decode_oem, dev_drive_info, device_info, filesystem_reg_value,
+    indexer_status, ntfs_data, refs_trim_disabled, short_names_disabled_on_volume, volume_dirty,
+    BypassIoStatus,
 };
 use ntfs_unthrottle::{display_path, fragment_count, volume_info};
 
@@ -34,11 +35,13 @@ const MFT_FRAGMENT_WARN: u64 = 64;
 pub enum OptLabel {
     Drive,
     FileSystem,
+    DevDrive,
     Space,
     Cluster,
     Mft,
     ShortNames,
     BypassIo,
+    Indexer,
     LastAccess,
     TrimNtfs,
     TrimRefs,
@@ -179,6 +182,21 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
 
         if is_refs {
             info(OptLabel::FileSystem, l.refs_info());
+            match dev_drive_info(root) {
+                Ok(dd) if dd.is_dev_drive && dd.is_trusted => {
+                    ok(OptLabel::DevDrive, l.dev_drive_trusted(&vol));
+                }
+                Ok(dd) if dd.is_dev_drive => {
+                    warn(OptLabel::DevDrive, l.dev_drive_untrusted());
+                    plan.hints.push(l.hint_dev_drive_untrusted(&vol));
+                }
+                Ok(_) => info(OptLabel::DevDrive, l.dev_drive_no()),
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    info(OptLabel::DevDrive, l.admin_only());
+                    admin_hint = true;
+                }
+                Err(e) => info(OptLabel::DevDrive, l.not_queryable_err(e)),
+            }
         }
 
         // --- Space, clusters, MFT ---------------------------------------------
@@ -301,6 +319,20 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
                 }
                 Ok(BypassIoStatus::Unavailable) => info(OptLabel::BypassIo, l.bypass_unavailable()),
                 Err(e) => info(OptLabel::BypassIo, l.not_queryable_err(e)),
+            }
+        }
+
+        // --- Windows Search Indexer (read-only, gentle info note) ------------
+        if is_ntfs || is_refs {
+            let idx = indexer_status(root);
+            if idx.service_disabled == Some(true) || idx.root_not_indexed == Some(true) {
+                ok(OptLabel::Indexer, l.indexer_off());
+            } else if is_system {
+                info(OptLabel::Indexer, l.indexer_system());
+            } else if idx.root_not_indexed == Some(false) {
+                info(OptLabel::Indexer, l.indexer_active_soft(&vol));
+            } else {
+                info(OptLabel::Indexer, l.not_queryable());
             }
         }
         println!();

@@ -705,6 +705,7 @@ impl Lang {
             (Lang::De, OptLabel::Drive) => "Datenträger:",
             (Lang::En, OptLabel::FileSystem) => "File system:",
             (Lang::De, OptLabel::FileSystem) => "Dateisystem:",
+            (Lang::En | Lang::De, OptLabel::DevDrive) => "Dev Drive:",
             (Lang::En, OptLabel::Space) => "Space:",
             (Lang::De, OptLabel::Space) => "Platz:",
             (Lang::En | Lang::De, OptLabel::Cluster) => "Cluster:",
@@ -712,6 +713,7 @@ impl Lang {
             (Lang::En, OptLabel::ShortNames) => "8.3 names:",
             (Lang::De, OptLabel::ShortNames) => "8.3-Namen:",
             (Lang::En | Lang::De, OptLabel::BypassIo) => "BypassIO:",
+            (Lang::En | Lang::De, OptLabel::Indexer) => "Indexer:",
             (Lang::En, OptLabel::LastAccess) => "Last access:",
             (Lang::De, OptLabel::LastAccess) => "Last-Access:",
             (Lang::En | Lang::De, OptLabel::TrimNtfs) => "TRIM (NTFS):",
@@ -782,8 +784,67 @@ impl Lang {
 
     pub fn refs_info(self) -> &'static str {
         match self {
-            Lang::En => "ReFS (e.g. Dev Drive) – MFT/8.3 do not apply, TRIM see [Global]",
-            Lang::De => "ReFS (z. B. Dev Drive) – MFT/8.3 entfallen, TRIM siehe [Global]",
+            Lang::En => "ReFS – MFT/8.3 do not apply, TRIM see [Global]",
+            Lang::De => "ReFS – MFT/8.3 entfallen, TRIM siehe [Global]",
+        }
+    }
+
+    pub fn dev_drive_trusted(self, vol: impl Display) -> String {
+        match self {
+            Lang::En => format!("trusted (Defender async mode; verify filters: `fsutil devdrv query {vol}`)"),
+            Lang::De => format!("vertrauenswürdig (Defender-Async-Modus; prüfen: `fsutil devdrv query {vol}`)"),
+        }
+    }
+
+    pub fn dev_drive_untrusted(self) -> &'static str {
+        match self {
+            Lang::En => "untrusted – Defender runs synchronous blocking scans",
+            Lang::De => "nicht vertrauenswürdig – Defender scannt synchron und bremst",
+        }
+    }
+
+    pub fn hint_dev_drive_untrusted(self, vol: impl Display) -> String {
+        match self {
+            Lang::En => format!(
+                "{vol} is an untrusted Dev Drive: enable Defender async performance mode with \
+                 `fsutil devdrv trust {vol}` and inspect filters via `fsutil devdrv query {vol}`."
+            ),
+            Lang::De => format!(
+                "{vol} ist ein nicht vertrauenswürdiges Dev Drive: Defender-Performance-Modus aktivieren mit \
+                 `fsutil devdrv trust {vol}` und Filter prüfen via `fsutil devdrv query {vol}`."
+            ),
+        }
+    }
+
+    pub fn dev_drive_no(self) -> &'static str {
+        match self {
+            Lang::En => "no (standard ReFS)",
+            Lang::De => "nein (Standard-ReFS)",
+        }
+    }
+
+    pub fn indexer_off(self) -> &'static str {
+        match self {
+            Lang::En => "disabled on volume or WSearch service off",
+            Lang::De => "auf Volume oder über WSearch-Dienst aus",
+        }
+    }
+
+    pub fn indexer_active_soft(self, vol: impl Display) -> String {
+        match self {
+            Lang::En => format!(
+                "content indexing permitted on {vol} root (check Indexing Options / Drive Properties if build folders are crawled)"
+            ),
+            Lang::De => format!(
+                "Inhaltsindizierung auf {vol}-Root erlaubt (bei Build-Ordnern Indizierungsoptionen / Laufwerkseigenschaften prüfen)"
+            ),
+        }
+    }
+
+    pub fn indexer_system(self) -> &'static str {
+        match self {
+            Lang::En => "active on system drive (normal for Windows Search)",
+            Lang::De => "auf Systemlaufwerk aktiv (normal für Windows-Suche)",
         }
     }
 
@@ -1254,11 +1315,13 @@ mod tests {
             for o in [
                 OptLabel::Drive,
                 OptLabel::FileSystem,
+                OptLabel::DevDrive,
                 OptLabel::Space,
                 OptLabel::Cluster,
                 OptLabel::Mft,
                 OptLabel::ShortNames,
                 OptLabel::BypassIo,
+                OptLabel::Indexer,
                 OptLabel::LastAccess,
                 OptLabel::TrimNtfs,
                 OptLabel::TrimRefs,
