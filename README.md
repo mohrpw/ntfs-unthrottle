@@ -239,7 +239,9 @@ independently of compression:
 | Last-Access timestamps | `fsutil behavior set disablelastaccess 1` |
 | TRIM on NTFS SSDs | `fsutil behavior set DisableDeleteNotify NTFS 0` |
 | TRIM on ReFS SSDs (Dev Drive) | `fsutil behavior set DisableDeleteNotify ReFS 0` |
+| ReFS Dev Drive trust status | – (points to `fsutil devdrv trust` / `query` if untrusted) |
 | BypassIO (Windows 11, NTFS): active / partial / blocked by `<driver.sys>` | – (points to `fsutil bypassIo state /v E:\` & `fltmc filters`) |
+| Windows Search Indexer (`WSearch` / root attribute) | – (soft advisory on data drives) |
 | Volume dirty bit | – (points to `chkdsk E: /scan`) |
 
 The BypassIO check sends `FSCTL_MANAGE_BYPASS_IO` (`FS_BPIO_OP_QUERY`, no admin required)
@@ -268,18 +270,21 @@ ntfs-unthrottle E:\ --optimize --fix    # apply safe tweaks (elevated terminal)
 | `-y, --yes` | *off* | Skip confirmation prompt (requires `--fix`) |
 | `--recommended` | *off* | Recommended mode (alias `--recommend`); conflicts with `--all` |
 | `--all` | *off* | Include every compressed file `>= --min-size` regardless of ratio/extension |
+| `--only <REASON>` | *empty* | Restrict to `extension`, `low-savings`, `write-heavy`, `build`, `ds`, `all` (auto-enables their detectors; repeatable/comma-separated) |
 | `--min-size <MiB>` | `16` | Minimum file size threshold in MiB |
 | `--threshold <PERCENT>` | `90` | Physical/logical ratio (%) above which compression is considered useless |
 | `--keep-dir-flags` | *off* | Do not clear compression attributes on directories |
+| `--clear-dirs` | *off* | Clear all found directory compression flags even when `--only` is set (conflicts with `--keep-dir-flags`) |
 | `--no-wof` | *off* | Skip WOF/CompactOS detection (avoids opening large uncompressed-flag files) |
 | `--no-fragments` | *off* | Skip physical fragment count lookup |
+| `--json` | *off* | Emit machine-readable JSON on stdout (`--fix --json` requires `--yes`) |
 | `--optimize` | *off* | Run volume/hardware diagnostics instead of file scan |
 | `-v, --verbose` | *off* | List all candidates, directories, and per-file errors |
 | `-x, --exclude <NAME\|PATH>` | *empty* | Exclude directory/file name (any depth) or path prefix; repeatable |
 | `--lang <auto\|en\|de>` | `auto` | Language of runtime output (`--help` is always English) |
 
 **Exit codes:** `0` nothing to do / all fixed · `1` error · `2` dry-run found candidates ·
-`3` some items failed.
+`3` some items failed · `130` interrupted (`Ctrl+C`).
 
 **Output language:** With `--lang auto`, the language is taken from `LC_ALL`, `LC_MESSAGES`
 or `LANG` (ignored if empty or `C`/`POSIX`), otherwise from the Windows UI language.
@@ -302,8 +307,9 @@ directly on the command line (skipped with `⛔`, remaining paths proceed normal
 - **Safety net:** Any root-level entry with `HIDDEN | SYSTEM` attributes
 - **Per-volume free-space check:** Verifies `logical − physical` delta plus a safety buffer
   (`max(256 MiB, 1%)`) before modifying files
-- **Cloud & reparse protection:** Skips OneDrive/cloud placeholders (`OFFLINE` / `RECALL_*`)
-  and reparse points (junctions, symlinks, dedup)
+- **Cloud, sparse & reparse protection:** Skips OneDrive/cloud placeholders
+  (`OFFLINE` / `RECALL_*`), sparse files (`SPARSE_FILE`, to avoid materializing zero ranges),
+  and reparse points (junctions, symlinks, dedup), plus checks reparse attributes on open directory handles
 
 ---
 
@@ -321,27 +327,39 @@ ntfs-unthrottle = { git = "https://github.com/mohrpw/ntfs-unthrottle.git", defau
 
 | Feature | Default | Contents |
 |---|---|---|
-| `cli` | yes | The `ntfs-unthrottle` binary (`clap`, `console`, `humansize`, `indicatif`, `walkdir`); enables `tune` |
-| `tune` | via `cli` | `ntfs_unthrottle::tune` – volume/drive diagnostics (TRIM, BypassIO, MFT, 8.3 names) |
+| `cli` | yes | The `ntfs-unthrottle` binary (`clap`, `console`, `humansize`, `indicatif`, `serde_json`, `walkdir`); enables `tune` |
+| `tune` | via `cli` | `ntfs_unthrottle::tune` – volume/drive diagnostics (TRIM, BypassIO, Dev Drive, MFT, 8.3 names, Indexer) |
 
 ```rust
+use std::fs::OpenOptions;
 use std::io::Write;
+use ntfs_unthrottle::UncompressedOpenOptions;
 
 fn main() -> std::io::Result<()> {
     ntfs_unthrottle::create_dir_all_uncompressed("D:/out/romfs")?;
-    let mut out = ntfs_unthrottle::create_uncompressed("D:/out/romfs/archive.bin")?;
+    let mut out = ntfs_unthrottle::create_uncompressed_with_size("D:/out/romfs/archive.bin", data.len() as u64)?;
     out.write_all(&data)?;
+
+    // Or combine custom OpenOptions (e.g. create_new, FILE_FLAG_SEQUENTIAL_SCAN):
+    let _f = OpenOptions::new().read(true).write(true).create_new(true).open_uncompressed("D:/out/romfs/new.bin")?;
     Ok(())
 }
 ```
 
-- `create_uncompressed(path)` – creates/truncates a file and disables compression **only if**
-  it inherited `FILE_ATTRIBUTE_COMPRESSED`: on normal folders no extra IOCTL is issued.
-  The guard is **best-effort**: if the FSCTL is rejected (e.g. by a filter driver), the file
-  is still returned; only open/create errors are reported.
+- `create_uncompressed(path)` / `create_uncompressed_with_size(path, size)` – creates/truncates a
+  file, disables compression **only if** it inherited `FILE_ATTRIBUTE_COMPRESSED` (no extra IOCTL
+  in normal folders), and in `_with_size` reserves contiguous space (`FileAllocationInfo`) so
+  NTFS/ReFS avoids fragmentation. Both compression removal and pre-allocation in these wrappers
+  are **best-effort**: if rejected (e.g. FAT32/exFAT/SMB quota or filter driver), the file is still
+  returned; only open/create errors are reported.
+- `UncompressedOpenOptions` (`open_uncompressed(path)` / `open_uncompressed_with_size(path, size)`) –
+  extension trait on `std::fs::OpenOptions` for callers needing `create_new(true)` or custom Windows
+  flags while keeping the same best-effort compression and allocation guards.
+- `preallocate(&file, size)` – explicit/strict wrapper around `SetFileInformationByHandle(FileAllocationInfo)`
+  (requires write access; returns errors, and treats `size == 0` or existing length `>= size` as a no-op).
 - `create_dir_all_uncompressed(path)` – like `std::fs::create_dir_all`, but clears the
   compression flag on every newly created folder and on the target folder itself
-  (existing folders above it are left alone). Also best-effort.
+  (existing folders above it and reparse points are left alone). Also best-effort.
 - `clear_dir_compression(dir)` – clears a folder's compression flag if set.
 - `compression_kind(path)` – `None`, `Some(Lznt1)` or `Some(Wof(..))`, e.g. for a pre-flight
   warning that an input file is stored compressed.

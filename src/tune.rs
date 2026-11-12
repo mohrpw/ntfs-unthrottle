@@ -17,8 +17,9 @@ use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP};
 use windows_sys::Win32::Storage::FileSystem::{
     GetVolumeNameForVolumeMountPointW, BusTypeAta, BusTypeFileBackedVirtual, BusTypeNvme,
     BusTypeRAID, BusTypeSas, BusTypeSata, BusTypeScsi, BusTypeSd, BusTypeSpaces, BusTypeUsb,
-    BusTypeVirtual, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_NO_BUFFERING, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE,
+    BusTypeVirtual, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_NO_BUFFERING, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
 };
 use windows_sys::Win32::System::Ioctl::{
     PropertyStandardQuery, StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
@@ -27,12 +28,13 @@ use windows_sys::Win32::System::Ioctl::{
     FSCTL_QUERY_PERSISTENT_VOLUME_STATE, IOCTL_STORAGE_QUERY_PROPERTY, NTFS_VOLUME_DATA_BUFFER,
     FSBPIO_INFL_None, FSBPIO_INFL_SKIP_STORAGE_STACK_QUERY, FSBPIO_OUTFL_COMPATIBLE_STORAGE_DRIVER,
     FSCTL_MANAGE_BYPASS_IO, FS_BPIO_INPUT, FS_BPIO_OP_QUERY, FS_BPIO_OUTPUT, FS_BPIO_RESULTS,
-    PERSISTENT_VOLUME_STATE_SHORT_NAME_CREATION_DISABLED, STORAGE_DEVICE_DESCRIPTOR,
-    STORAGE_PROPERTY_ID, STORAGE_PROPERTY_QUERY,
+    PERSISTENT_VOLUME_STATE_DEV_VOLUME, PERSISTENT_VOLUME_STATE_SHORT_NAME_CREATION_DISABLED,
+    PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME, STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_ID,
+    STORAGE_PROPERTY_QUERY,
 };
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_QWORD};
 
-use crate::{ioctl, is_unsupported, to_wide};
+use crate::{file_attributes, ioctl, is_unsupported, to_wide};
 
 const VOLUME_IS_DIRTY: u32 = 0x1;
 
@@ -89,6 +91,14 @@ fn open_volume(root: &Path) -> io::Result<File> {
         .access_mode(0)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(volume_device(root)?)
+}
+
+fn open_root_dir_meta(root: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(root)
 }
 
 fn open_root_dir(root: &Path) -> io::Result<File> {
@@ -217,12 +227,10 @@ pub fn ntfs_data(root: &Path) -> io::Result<NtfsData> {
     })
 }
 
-/// Is 8.3 short name creation disabled for this volume (volume flag)?
-pub fn short_names_disabled_on_volume(root: &Path) -> io::Result<bool> {
-    let dir = open_root_dir(root)?;
+fn query_persistent_volume_state(handle: &File, mask: u32) -> io::Result<u32> {
     let input = FILE_FS_PERSISTENT_VOLUME_INFORMATION {
         VolumeFlags: 0,
-        FlagMask: PERSISTENT_VOLUME_STATE_SHORT_NAME_CREATION_DISABLED,
+        FlagMask: mask,
         Version: 1,
         Reserved: 0,
     };
@@ -230,7 +238,7 @@ pub fn short_names_disabled_on_volume(root: &Path) -> io::Result<bool> {
     // SAFETY: input/output are valid structs.
     unsafe {
         ioctl(
-            &dir,
+            handle,
             FSCTL_QUERY_PERSISTENT_VOLUME_STATE,
             (&input as *const FILE_FS_PERSISTENT_VOLUME_INFORMATION).cast(),
             size_of::<FILE_FS_PERSISTENT_VOLUME_INFORMATION>() as u32,
@@ -238,7 +246,40 @@ pub fn short_names_disabled_on_volume(root: &Path) -> io::Result<bool> {
             size_of::<FILE_FS_PERSISTENT_VOLUME_INFORMATION>() as u32,
         )?;
     }
-    Ok(out.VolumeFlags & PERSISTENT_VOLUME_STATE_SHORT_NAME_CREATION_DISABLED != 0)
+    Ok(out.VolumeFlags)
+}
+
+/// Is 8.3 short name creation disabled for this volume (volume flag)?
+pub fn short_names_disabled_on_volume(root: &Path) -> io::Result<bool> {
+    let dir = open_root_dir(root)?;
+    let flags = query_persistent_volume_state(&dir, PERSISTENT_VOLUME_STATE_SHORT_NAME_CREATION_DISABLED)?;
+    Ok(flags & PERSISTENT_VOLUME_STATE_SHORT_NAME_CREATION_DISABLED != 0)
+}
+
+/// Windows 11 Dev Drive status of a volume (via `FSCTL_QUERY_PERSISTENT_VOLUME_STATE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DevDriveInfo {
+    pub is_dev_drive: bool,
+    /// `true` if the Dev Drive is marked trusted (Defender asynchronous performance mode).
+    pub is_trusted: bool,
+}
+
+/// Decodes `PERSISTENT_VOLUME_STATE_*` flags into [`DevDriveInfo`].
+pub fn classify_dev_drive(flags: u32) -> DevDriveInfo {
+    DevDriveInfo {
+        is_dev_drive: flags & PERSISTENT_VOLUME_STATE_DEV_VOLUME != 0,
+        is_trusted: flags & PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME != 0,
+    }
+}
+
+/// Queries whether `root` is a Windows 11 Dev Drive and whether it is trusted.
+/// Opens the volume/root handle with `DesiredAccess = 0` so non-admin callers
+/// succeed wherever the file system driver permits metadata-only queries.
+pub fn dev_drive_info(root: &Path) -> io::Result<DevDriveInfo> {
+    let handle = open_volume(root).or_else(|_| open_root_dir_meta(root))?;
+    let mask = PERSISTENT_VOLUME_STATE_DEV_VOLUME | PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME;
+    let flags = query_persistent_volume_state(&handle, mask)?;
+    Ok(classify_dev_drive(flags))
 }
 
 /// Is the dirty bit set (chkdsk pending at next boot)?
@@ -259,9 +300,9 @@ pub fn volume_dirty(root: &Path) -> io::Result<bool> {
     Ok(flags & VOLUME_IS_DIRTY != 0)
 }
 
-/// DWORD/QWORD (Windows stores some switches as QWORD) from `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
-pub fn filesystem_reg_value(name: &str) -> Option<u64> {
-    let key = to_wide(Path::new(r"SYSTEM\CurrentControlSet\Control\FileSystem"));
+/// DWORD/QWORD value from `HKLM\<subkey>`.
+fn reg_u64(subkey: &str, name: &str) -> Option<u64> {
+    let key = to_wide(Path::new(subkey));
     let val = to_wide(Path::new(name));
     let mut data = 0u64;
     let mut len = 8u32;
@@ -278,6 +319,31 @@ pub fn filesystem_reg_value(name: &str) -> Option<u64> {
         )
     };
     (rc == ERROR_SUCCESS).then_some(data)
+}
+
+/// DWORD/QWORD (Windows stores some switches as QWORD) from `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
+pub fn filesystem_reg_value(name: &str) -> Option<u64> {
+    reg_u64(r"SYSTEM\CurrentControlSet\Control\FileSystem", name)
+}
+
+/// Read-only Windows Search Indexer state for a volume root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IndexerStatus {
+    /// `Some(true)` if `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED` is set on the volume root.
+    pub root_not_indexed: Option<bool>,
+    /// `Some(true)` if the `WSearch` service startup type is `Disabled` (`Start == 4`).
+    pub service_disabled: Option<bool>,
+}
+
+/// Queries the Windows Search service startup state and root `NOT_CONTENT_INDEXED` attribute.
+pub fn indexer_status(root: &Path) -> IndexerStatus {
+    const SERVICE_DISABLED: u64 = 4;
+    let root_not_indexed = file_attributes(root)
+        .ok()
+        .map(|a| a & FILE_ATTRIBUTE_NOT_CONTENT_INDEXED != 0);
+    let service_disabled =
+        reg_u64(r"SYSTEM\CurrentControlSet\Services\WSearch", "Start").map(|v| v == SERVICE_DISABLED);
+    IndexerStatus { root_not_indexed, service_disabled }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,5 +575,27 @@ mod tests {
     fn decode_oem_ascii_roundtrip() {
         assert_eq!(decode_oem(b""), "");
         assert_eq!(decode_oem(b"ReFS DisableDeleteNotify = 0"), "ReFS DisableDeleteNotify = 0");
+    }
+
+    #[test]
+    fn classify_dev_drive_flags() {
+        assert_eq!(classify_dev_drive(0), DevDriveInfo { is_dev_drive: false, is_trusted: false });
+        assert_eq!(
+            classify_dev_drive(PERSISTENT_VOLUME_STATE_DEV_VOLUME),
+            DevDriveInfo { is_dev_drive: true, is_trusted: false }
+        );
+        assert_eq!(
+            classify_dev_drive(PERSISTENT_VOLUME_STATE_DEV_VOLUME | PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME),
+            DevDriveInfo { is_dev_drive: true, is_trusted: true }
+        );
+    }
+
+    #[test]
+    fn dev_drive_and_indexer_probes_do_not_panic() {
+        let sys = PathBuf::from(format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())));
+        // On NTFS/ReFS volumes this should either return Ok(...) or an OS error (e.g. unsupported/access denied).
+        let _ = dev_drive_info(&sys);
+        let idx = indexer_status(&sys);
+        assert!(idx.root_not_indexed.is_some());
     }
 }
