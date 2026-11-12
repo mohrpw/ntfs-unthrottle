@@ -9,7 +9,7 @@
 ## Inhaltsverzeichnis
 
 1. [Das Problem: Unsichtbare I/O-Bremsen unter Windows](#das-problem-unsichtbare-io-bremsen-unter-windows)
-2. [Praxis-Benchmark (Entstehungsmessung, Stand v0.2.0)](#praxis-benchmark-entstehungsmessung-stand-v020)
+2. [Praxis-Benchmarks (v0.2.0 & Messreihe v0.7.0)](#praxis-benchmarks-v020--messreihe-v070)
 3. [Was das Tool macht](#was-das-tool-macht)
 4. [Installation und Bauen](#installation-und-bauen)
 5. [Schnellstart](#schnellstart)
@@ -54,7 +54,7 @@ entfernt nur wirklich kontraproduktive Komprimierung.
 
 ---
 
-## Praxis-Benchmark (Entstehungsmessung, Stand v0.2.0)
+## Praxis-Benchmarks (v0.2.0 & Messreihe v0.7.0)
 
 `ntfs-unthrottle` entstand aus einem realen Performance-Post-Mortem beim Entpacken
 eines verschlüsselten `6,27-GB`-Binärcontainers (`3.848` Einzeldateien) unter
@@ -70,8 +70,19 @@ selbst paralleler Rust-Code (`rayon`, `seek_read`, AES-NI) skalierte kaum.
 | Kontrolllauf Schritt 1 (Container-Extraktion, `6,27 GB`) | `111,64 s` | `13,05 s` | **~8,6×** |
 | Kontrolllauf gesamt (Container + Entschlüsselung von `3.848` Dateien, freier SLC-Cache) | `218,67 s` | `85,74 s` | **~2,6×** |
 
-*(Referenzwert auf unkomprimierter NVMe-SSD `C:`: `22,43–31,09 s`. Ein aktualisierter
-Benchmark für `v0.6.0` inkl. WOF/DirectStorage/BypassIO folgt.)*
+### Erweiterte Messreihe (`v0.7.0`, NVMe & SATA-QLC)
+
+Gemessen unter Windows 11 x64 (`WDC WDS250G1B0C-00S6U0` NVMe `C:` und `Samsung 870 QVO 1TB`
+SATA-QLC `E:`) mit explizitem `sync_all()`-Flush, `8 s` Abkühl-/TRIM-Pause zwischen allen
+Einzelläufen sowie `FILE_FLAG_NO_BUFFERING` für ungepufferte Lese-Tests:
+
+| Workload (Methodik) | Komprimiert / Ungeschützt | Unkomprimiert / `v0.7.0`-Guard | Ergebnis |
+|---|---:|---:|---|
+| **Seq. Schreiben** (`512 MiB` inkompressibel, `sync_all`, NVMe, Ø 2 Läufe) | `7,65 s` (`66,9 MiB/s`) | **`1,31 s` (`391,2 MiB/s`)** | **~5,8× schneller** (`0` Overhead auf Normalordnern: `1,40 s` vs. `1,41 s`) |
+| **Random-4K-Schreiben** (`64 MiB`, `1.500 × 4 KiB` + `sync_all`, NVMe) | `0,86 s` (`1.748 IOPS`, `1.081` Fragm.) | **`0,07 s` (`21.430 IOPS`, `1` Fragm.)** | **~12,3× höhere IOPS** (`WOF/XPRESS4K` entpackt beim Write auf `64 MiB`) |
+| **Kalt-Lesen** (`256 MiB`, `FILE_FLAG_NO_BUFFERING`, NVMe) | WOF `XPRESS4K`: `540,8 MiB/s` (`6.507` IOPS) | **`1.224,4 MiB/s` (`7.814` IOPS)** | **~2,3×** schnellerer seq. Read als WOF (WOF spart dabei 41 % Platz) |
+| **Container-Extraktion** (`6,23 GiB` verschlüsselt, `E:` QLC → `C:` NVMe) | `89,28 s` (`284` Fragm., `308 KiB` gespart) | **`22,71 s` (`~281 MiB/s`)** | **~3,9× schneller**; `--fix` einer `16.306`-Fragm.-Quelle (`39,50 s`) beschleunigte `E:` von `108,44 s` → `67,83 s` |
+| **Kleindatei-Archiv** (`1,27 GiB`, `7.636` Dateien, `1.063` Ordner via `7z`, NVMe) | `10,54 s` (`1.064` Ordner + `67` `.db`/`.ldb`/`.dll` + `626`-Fragm.-Cache infiziert) | `11,72 s` sauber; `--recommended --fix` in **`0,84 s`** | Entpacken selbst MFT-/CPU-gebunden; CLI bereinigt Folgeschäden in `< 1 s` |
 
 ---
 
@@ -381,7 +392,10 @@ Auf anderen Plattformen als Windows kompilieren die obigen Funktionen als günst
   auf NVMe jedoch durchaus.
 - `FSCTL_SET_COMPRESSION` mit `COMPRESSION_FORMAT_NONE` blockiert, bis die Datei
   vollständig unkomprimiert neu geschrieben ist. Es braucht dafür nur die Differenz
-  `logisch − physisch` an freiem Platz.
+  `logisch − physisch` an freiem Platz. Auf SSDs steigt der Lesedurchsatz sofort wieder
+  auf volle Geschwindigkeit, obwohl physische Extents dabei nicht in-place zusammengelegt
+  werden (auf mechanischen HDDs kann bei extrem fragmentierten Dateien anschließend ein
+  `defrag` sinnvoll sein).
 
 ## Mitwirken
 

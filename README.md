@@ -9,7 +9,7 @@
 ## Table of Contents
 
 1. [The Problem: Invisible Windows I/O Bottlenecks](#the-problem-invisible-windows-io-bottlenecks)
-2. [Real-World Benchmark (Origin Post-Mortem, v0.2.0)](#real-world-benchmark-origin-post-mortem-v020)
+2. [Real-World Benchmarks (v0.2.0 Origin & v0.7.0 Audit)](#real-world-benchmarks-v020-origin--v070-audit)
 3. [What It Does](#what-it-does)
 4. [Installation & Building](#installation--building)
 5. [Quick Start](#quick-start)
@@ -51,7 +51,7 @@ only counterproductive compression.
 
 ---
 
-## Real-World Benchmark (Origin Post-Mortem, v0.2.0)
+## Real-World Benchmarks (v0.2.0 Origin & v0.7.0 Audit)
 
 `ntfs-unthrottle` originated from a performance post-mortem while unpacking an encrypted
 `6.27 GB` binary container (`3,848` files) on Windows 11 onto a SATA SSD (`Samsung 870 QVO`,
@@ -66,8 +66,19 @@ multi-threaded Rust (`rayon`, `seek_read`, AES-NI) to hit a wall.
 | Controlled run step 1 (container extraction, `6.27 GB`) | `111.64 s` | `13.05 s` | **~8.6×** |
 | Controlled run total (container + decrypting `3,848` files, free SLC cache) | `218.67 s` | `85.74 s` | **~2.6×** |
 
-*(Reference baseline on an uncompressed NVMe SSD `C:`: `22.43–31.09 s`. An updated
-`v0.6.0` benchmark covering WOF/DirectStorage/BypassIO will follow.)*
+### Follow-Up Benchmark Suite (`v0.7.0`, NVMe & SATA-QLC)
+
+Measured on Windows 11 x64 (`WDC WDS250G1B0C-00S6U0` NVMe `C:` and `Samsung 870 QVO 1TB`
+SATA-QLC `E:`), with `sync_all()` flushes, 8 s cooldowns between runs, and
+`FILE_FLAG_NO_BUFFERING` for uncached reads:
+
+| Workload (Method) | Compressed / Unguarded | Uncompressed / `v0.7.0` Guard | Result |
+|---|---:|---:|---|
+| **Seq. Write** (`512 MiB` incompressible, `sync_all`, NVMe, 2-run avg) | `7.65 s` (`66.9 MiB/s`) | **`1.31 s` (`391.2 MiB/s`)** | **~5.8× faster** (`0` overhead on normal folders: `1.40 s` vs. `1.41 s`) |
+| **Random 4K Write** (`64 MiB`, `1,500 × 4 KiB` + `sync_all`, NVMe) | `0.86 s` (`1,748 IOPS`, `1,081` frags) | **`0.07 s` (`21,430 IOPS`, `1` frag)** | **~12.3× higher IOPS** (`WOF/XPRESS4K` unpacks to `64 MiB` on write) |
+| **Uncached Read** (`256 MiB`, `FILE_FLAG_NO_BUFFERING`, NVMe) | WOF `XPRESS4K`: `540.8 MiB/s` (`6,507` IOPS) | **`1,224.4 MiB/s` (`7,814` IOPS)** | **~2.3×** faster sequential uncached read vs. WOF (WOF saves 41% space) |
+| **Container Extract** (`6.23 GiB` encrypted, `E:` QLC → `C:` NVMe) | `89.28 s` (`284` frags, `308 KiB` saved) | **`22.71 s` (`~281 MiB/s`)** | **~3.9× faster**; fixing a `16,306`-frag LZNT1 source (`39.50 s`) sped `E:` extract from `108.44 s` → `67.83 s` |
+| **Small-File Archive** (`1.27 GiB`, `7,636` files, `1,063` dirs via `7z`, NVMe) | `10.54 s` (`1,064` dirs + `67` `.db`/`.ldb`/`.dll` + `626`-frag cache infected) | `11.72 s` clean; `--recommended --fix` in **`0.84 s`** | Small-file unpack itself is MFT/CPU-bound; CLI cleans fallout in `< 1 s` |
 
 ---
 
@@ -359,7 +370,10 @@ API and the CLI are Windows-only.
   Writing to a WOF file triggers automatic decompression by Windows, making WOF mainly
   relevant for build directories (frequent rewrites) and DirectStorage titles on NVMe.
 - `FSCTL_SET_COMPRESSION` (`COMPRESSION_FORMAT_NONE`) blocks until the file is rewritten
-  uncompressed and only needs `logical − physical` extra free space.
+  uncompressed and only needs `logical − physical` extra free space. On SSDs, read throughput
+  recovers immediately even though `FSCTL_SET_COMPRESSION` does not coalesce physical extents
+  in-place (on mechanical HDDs, running `defrag` afterwards can still help severely
+  fragmented files).
 
 ## Contributing
 
