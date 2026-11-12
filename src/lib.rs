@@ -1,11 +1,11 @@
-//! Low-Level-Bausteine, um NTFS- (LZNT1) und WOF-Komprimierung (CompactOS) zu
-//! erkennen und zu entfernen.
+//! Low-level building blocks to detect and remove NTFS (LZNT1) and WOF
+//! (CompactOS) compression.
 //!
-//! Die Funktionen sind bewusst klein gehalten, damit sie sich auch direkt in
-//! eigene Entpacker/Konverter einbinden lassen, siehe [`create_uncompressed`].
+//! The functions are intentionally small so they can be embedded directly into
+//! your own unpackers/converters, see [`create_uncompressed`].
 
 #[cfg(not(windows))]
-compile_error!("ntfs-unthrottle unterstützt ausschließlich Windows (NTFS).");
+compile_error!("ntfs-unthrottle only supports Windows (NTFS).");
 
 use std::ffi::c_void;
 use std::fmt;
@@ -40,14 +40,14 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 
 pub mod tune;
 
-/// `FILE_FILE_COMPRESSION` aus winnt.h (spart das SystemServices-Feature).
+/// `FILE_FILE_COMPRESSION` from winnt.h (avoids the SystemServices feature).
 const FILE_FILE_COMPRESSION: u32 = 0x0000_0010;
 
 // ---------------------------------------------------------------------------
-// Typen
+// Types
 // ---------------------------------------------------------------------------
 
-/// Algorithmus einer WOF-Komprimierung (`compact /exe:…`, CompactOS, CompactGUI).
+/// Algorithm of a WOF compression (`compact /exe:…`, CompactOS, CompactGUI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WofAlgorithm {
     Xpress4K,
@@ -81,12 +81,12 @@ impl fmt::Display for WofAlgorithm {
     }
 }
 
-/// Art der transparenten Komprimierung einer Datei.
+/// Kind of transparent compression of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompressionKind {
-    /// Klassische NTFS-Komprimierung (`FILE_ATTRIBUTE_COMPRESSED`, blaue Pfeile).
+    /// Classic NTFS compression (`FILE_ATTRIBUTE_COMPRESSED`, blue arrows).
     Lznt1,
-    /// Windows Overlay Filter – ohne sichtbares Attribut.
+    /// Windows Overlay Filter – without a visible attribute.
     Wof(WofAlgorithm),
 }
 
@@ -99,29 +99,29 @@ impl fmt::Display for CompressionKind {
     }
 }
 
-/// Informationen zum Volume, auf dem ein Pfad liegt.
+/// Information about the volume a path resides on.
 #[derive(Debug, Clone)]
 pub struct VolumeInfo {
-    /// Wurzel des Volumes bzw. Mount-Punkts, z. B. `C:\`.
+    /// Root of the volume or mount point, e.g. `C:\`.
     pub root: PathBuf,
-    /// Dateisystem, z. B. `NTFS`, `ReFS`, `exFAT`.
+    /// File system, e.g. `NTFS`, `ReFS`, `exFAT`.
     pub fs_name: String,
-    /// Unterstützt das Dateisystem dateibasierte Komprimierung?
+    /// Does the file system support file-based compression?
     pub supports_compression: bool,
-    /// Für den aktuellen Benutzer verfügbarer freier Platz in Bytes.
+    /// Free space available to the current user, in bytes.
     pub free_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
-// Hilfsfunktionen
+// Helpers
 // ---------------------------------------------------------------------------
 
-/// Null-terminierter UTF-16-String für Win32-Aufrufe.
+/// NUL-terminated UTF-16 string for Win32 calls.
 pub fn to_wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// Entfernt das `\\?\`-Präfix für die Anzeige (`\\?\UNC\srv\x` → `\\srv\x`).
+/// Strips the `\\?\` prefix for display (`\\?\UNC\srv\x` → `\\srv\x`).
 pub fn display_path(path: &Path) -> String {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -137,10 +137,10 @@ fn raw_handle(file: &File) -> HANDLE {
     file.as_raw_handle() as HANDLE
 }
 
-/// Dünner Wrapper um `DeviceIoControl`; liefert die Anzahl zurückgegebener Bytes.
+/// Thin wrapper around `DeviceIoControl`; returns the number of bytes returned.
 ///
 /// # Safety
-/// `input`/`output` müssen für die angegebenen Längen gültig sein.
+/// `input`/`output` must be valid for the given lengths.
 unsafe fn ioctl(
     file: &File,
     code: u32,
@@ -171,7 +171,7 @@ fn os_code(err: &io::Error) -> Option<u32> {
     err.raw_os_error().map(|c| c as u32)
 }
 
-/// Fehler, die bedeuten: „Dateisystem/Treiber kann das nicht“ (FAT, exFAT, ReFS, kein wof.sys).
+/// Errors meaning "the file system/driver cannot do this" (FAT, exFAT, ReFS, no wof.sys).
 fn is_unsupported(err: &io::Error) -> bool {
     matches!(
         os_code(err),
@@ -179,7 +179,7 @@ fn is_unsupported(err: &io::Error) -> bool {
     )
 }
 
-/// Öffnet ein Handle nur zum Abfragen von Metadaten (kein Daten-Zugriff, kein Sperren).
+/// Opens a handle for querying metadata only (no data access, no locking).
 pub fn open_for_query(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
@@ -188,34 +188,34 @@ pub fn open_for_query(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// `FSCTL_SET_COMPRESSION` verlangt laut IOCTL-Definition `FILE_READ_DATA | FILE_WRITE_DATA`.
+/// Per its IOCTL definition, `FSCTL_SET_COMPRESSION` requires `FILE_READ_DATA | FILE_WRITE_DATA`.
 fn open_for_modify(path: &Path, is_dir: bool) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.access_mode(FILE_READ_DATA | FILE_WRITE_DATA)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     if is_dir {
-        // Verzeichnis-Handles gibt es unter Windows nur mit Backup-Semantik.
+        // On Windows, directory handles only exist with backup semantics.
         opts.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     }
     opts.open(path)
 }
 
 // ---------------------------------------------------------------------------
-// Abfragen
+// Queries
 // ---------------------------------------------------------------------------
 
-/// Tatsächlich belegter Platz auf dem Datenträger (`GetCompressedFileSizeW`).
-/// Funktioniert für LZNT1, WOF und Sparse-Dateien.
+/// Space actually allocated on disk (`GetCompressedFileSizeW`).
+/// Works for LZNT1, WOF and sparse files.
 pub fn physical_size(path: &Path) -> io::Result<u64> {
     let wide = to_wide(path);
     let mut high = 0u32;
-    // Sonst könnte GetLastError unten einen veralteten Fehler eines früheren Aufrufs liefern.
-    // SAFETY: setzt nur den Thread-lokalen Fehlerwert.
+    // Otherwise GetLastError below could return a stale error from an earlier call.
+    // SAFETY: only sets the thread-local error value.
     unsafe { SetLastError(NO_ERROR) };
-    // SAFETY: wide ist null-terminiert, high ein gültiger Zeiger.
+    // SAFETY: wide is NUL-terminated, high is a valid pointer.
     let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
     if low == u32::MAX {
-        // u32::MAX kann auch ein gültiger Low-Teil sein → GetLastError entscheidet.
+        // u32::MAX can also be a valid low part → GetLastError decides.
         let err = unsafe { GetLastError() };
         if err != NO_ERROR {
             return Err(io::Error::from_raw_os_error(err as i32));
@@ -224,20 +224,20 @@ pub fn physical_size(path: &Path) -> io::Result<u64> {
     Ok((u64::from(high) << 32) | u64::from(low))
 }
 
-/// Liefert den WOF-Algorithmus, falls die Datei per WOF komprimiert ist.
-/// WIM-gestützte Dateien (WIMBoot) werden bewusst ignoriert.
+/// Returns the WOF algorithm if the file is WOF-compressed.
+/// WIM-backed files (WIMBoot) are intentionally ignored.
 pub fn wof_algorithm(path: &Path) -> io::Result<Option<WofAlgorithm>> {
     wof_algorithm_of(&open_for_query(path)?)
 }
 
-/// Wie [`wof_algorithm`], aber auf einem bereits geöffneten Handle.
+/// Like [`wof_algorithm`], but on an already opened handle.
 pub fn wof_algorithm_of(file: &File) -> io::Result<Option<WofAlgorithm>> {
     #[repr(C)]
     struct Buf {
         wof: WOF_EXTERNAL_INFO,
         file: FILE_PROVIDER_EXTERNAL_INFO_V1,
     }
-    // SAFETY: reine POD-Structs, Nullinitialisierung ist gültig.
+    // SAFETY: plain POD structs, zero initialization is valid.
     let mut buf: Buf = unsafe { std::mem::zeroed() };
     let res = unsafe {
         ioctl(
@@ -261,20 +261,20 @@ pub fn wof_algorithm_of(file: &File) -> io::Result<Option<WofAlgorithm>> {
     }
 }
 
-/// Anzahl physisch zusammenhängender Fragmente einer Datei
-/// (`FSCTL_GET_RETRIEVAL_POINTERS`). Bei LZNT1-Dateien typischerweise
-/// „ein Fragment pro 64-KiB-Compression-Unit“ – der eigentliche Bremsklotz.
+/// Number of physically contiguous fragments of a file
+/// (`FSCTL_GET_RETRIEVAL_POINTERS`). For LZNT1 files typically
+/// "one fragment per 64 KiB compression unit" – the actual bottleneck.
 pub fn fragment_count(path: &Path) -> io::Result<u64> {
     fragment_count_of(&open_for_query(path)?)
 }
 
-/// Wie [`fragment_count`], aber auf einem bereits geöffneten Handle.
+/// Like [`fragment_count`], but on an already opened handle.
 pub fn fragment_count_of(file: &File) -> io::Result<u64> {
 
-    // Layout RETRIEVAL_POINTERS_BUFFER:
-    //   u32 ExtentCount, (4 Byte Padding), i64 StartingVcn,
+    // Layout of RETRIEVAL_POINTERS_BUFFER:
+    //   u32 ExtentCount, (4 bytes padding), i64 StartingVcn,
     //   [ { i64 NextVcn, i64 Lcn } ; ExtentCount ]
-    const BUF_WORDS: usize = 8 * 1024; // 64 KiB, 8-Byte-ausgerichtet
+    const BUF_WORDS: usize = 8 * 1024; // 64 KiB, 8-byte aligned
     let mut buf = vec![0i64; BUF_WORDS];
     let mut start_vcn: i64 = 0;
     let mut fragments = 0u64;
@@ -294,7 +294,7 @@ pub fn fragment_count_of(file: &File) -> io::Result<u64> {
         let more = match res {
             Ok(_) => false,
             Err(e) if os_code(&e) == Some(ERROR_MORE_DATA) => true,
-            // Residente (sehr kleine) oder leere Dateien besitzen keine Extents.
+            // Resident (very small) or empty files have no extents.
             Err(e) if os_code(&e) == Some(ERROR_HANDLE_EOF) => return Ok(0),
             Err(e) => return Err(e),
         };
@@ -307,7 +307,7 @@ pub fn fragment_count_of(file: &File) -> io::Result<u64> {
             let lcn = buf[3 + i * 2];
             let len = next_vcn - vcn;
             if lcn != -1 {
-                // Sparse-Lücken (lcn == -1) überspringen; nur echte Sprünge zählen.
+                // Skip sparse holes (lcn == -1); only real jumps count.
                 if last_lcn_end != Some(lcn) {
                     fragments += 1;
                 }
@@ -323,28 +323,28 @@ pub fn fragment_count_of(file: &File) -> io::Result<u64> {
     Ok(fragments)
 }
 
-/// Eindeutige Identität einer Datei auf einem Volume – Hardlinks teilen sie.
+/// Unique identity of a file on a volume – hardlinks share it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     pub volume_serial: u32,
-    /// 64-Bit-Dateiindex (MFT-Referenz bei NTFS).
+    /// 64-bit file index (MFT reference on NTFS).
     pub index: u64,
-    /// Anzahl der Hardlinks (Namen) dieser Datei.
+    /// Number of hardlinks (names) of this file.
     pub links: u32,
 }
 
 impl FileIdentity {
-    /// Schlüssel für die Duplikat-Erkennung (ohne Link-Anzahl).
+    /// Key for duplicate detection (without the link count).
     pub fn key(&self) -> (u32, u64) {
         (self.volume_serial, self.index)
     }
 }
 
-/// Volume-Seriennummer, Dateiindex und Link-Anzahl eines offenen Handles.
+/// Volume serial number, file index and link count of an open handle.
 pub fn file_identity_of(file: &File) -> io::Result<FileIdentity> {
-    // SAFETY: reine POD-Struktur, Nullinitialisierung ist gültig.
+    // SAFETY: plain POD struct, zero initialization is valid.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: Handle gültig, Zeiger auf ausreichend große Struktur.
+    // SAFETY: valid handle, pointer to a sufficiently large struct.
     if unsafe { GetFileInformationByHandle(raw_handle(file), &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -355,20 +355,20 @@ pub fn file_identity_of(file: &File) -> io::Result<FileIdentity> {
     })
 }
 
-/// Volume-Wurzel, Dateisystem und freien Platz für einen Pfad ermitteln.
+/// Determines volume root, file system and free space for a path.
 pub fn volume_info(path: &Path) -> io::Result<VolumeInfo> {
     let wide = to_wide(path);
     let mut root = vec![0u16; 1024];
-    // SAFETY: Puffer gültig, Länge in Zeichen.
+    // SAFETY: valid buffer, length in characters.
     if unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let root_len = root.iter().position(|&c| c == 0).unwrap_or(root.len());
-    root.truncate(root_len + 1); // inkl. Null
+    root.truncate(root_len + 1); // incl. NUL
 
     let mut fs_name = vec![0u16; 64];
     let mut fs_flags = 0u32;
-    // SAFETY: alle Zeiger gültig oder null.
+    // SAFETY: all pointers are valid or null.
     let ok = unsafe {
         GetVolumeInformationW(
             root.as_ptr(),
@@ -387,7 +387,7 @@ pub fn volume_info(path: &Path) -> io::Result<VolumeInfo> {
     let fs_len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
 
     let mut free = 0u64;
-    // SAFETY: root ist null-terminiert.
+    // SAFETY: root is NUL-terminated.
     if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free, null_mut(), null_mut()) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -400,7 +400,7 @@ pub fn volume_info(path: &Path) -> io::Result<VolumeInfo> {
     })
 }
 
-/// Rohe Dateiattribute (`GetFileAttributesW`).
+/// Raw file attributes (`GetFileAttributesW`).
 pub fn file_attributes(path: &Path) -> io::Result<u32> {
     let wide = to_wide(path);
     let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
@@ -411,8 +411,8 @@ pub fn file_attributes(path: &Path) -> io::Result<u32> {
     }
 }
 
-/// Ist `path` die Wurzel des Systemlaufwerks (`sysdrive`, z. B. `C:`)?
-/// Erkennt `C:\` ebenso wie `\\?\C:\`.
+/// Is `path` the root of the system drive (`sysdrive`, e.g. `C:`)?
+/// Recognizes `C:\` as well as `\\?\C:\`.
 pub fn is_system_drive_root(path: &Path, sysdrive: &str) -> bool {
     if path.parent().is_some() {
         return false;
@@ -422,9 +422,9 @@ pub fn is_system_drive_root(path: &Path, sysdrive: &str) -> bool {
     !a.is_empty() && a.eq_ignore_ascii_case(sysdrive.trim_end_matches('\\'))
 }
 
-/// Alle übergeordneten Ordner (ohne `path` selbst), die das Komprimierungsflag tragen.
-/// Neue *Unterordner* dort erben das Flag weiterhin. Die Laufwerkswurzel (z. B. `E:\`)
-/// zählt mit – außer beim Systemlaufwerk, dort ist das Flag Sache von Windows.
+/// All ancestor folders (excluding `path` itself) that carry the compression flag.
+/// New *subfolders* there keep inheriting the flag. The drive root (e.g. `E:\`)
+/// counts as well – except on the system drive, where the flag is Windows' business.
 pub fn compressed_ancestors(path: &Path) -> Vec<PathBuf> {
     let sysdrive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
     path.ancestors()
@@ -437,11 +437,11 @@ pub fn compressed_ancestors(path: &Path) -> Vec<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Änderungen
+// Modifications
 // ---------------------------------------------------------------------------
 
-/// Nimmt den Schreibschutz für die Lebensdauer des Guards heraus und stellt
-/// ihn im `Drop` wieder her – auch bei Fehlern/Panics.
+/// Clears the read-only attribute for the lifetime of the guard and restores
+/// it in `Drop` – even on errors/panics.
 pub struct ReadonlyGuard {
     wide: Vec<u16>,
     restore: bool,
@@ -478,12 +478,12 @@ impl Drop for ReadonlyGuard {
     }
 }
 
-/// Roher `FSCTL_SET_COMPRESSION(COMPRESSION_FORMAT_NONE)` ohne Fehlerunterdrückung.
-/// Bei bereits komprimierten Dateien blockiert der Aufruf, bis NTFS alle
-/// Compression-Units unkomprimiert neu geschrieben hat.
+/// Raw `FSCTL_SET_COMPRESSION(COMPRESSION_FORMAT_NONE)` without error suppression.
+/// For already compressed files the call blocks until NTFS has rewritten all
+/// compression units uncompressed.
 fn set_compression_none(file: &File) -> io::Result<()> {
     let format: u16 = COMPRESSION_FORMAT_NONE;
-    // SAFETY: Eingabepuffer gültig für die angegebene Länge.
+    // SAFETY: input buffer is valid for the given length.
     unsafe {
         ioctl(
             file,
@@ -497,14 +497,14 @@ fn set_compression_none(file: &File) -> io::Result<()> {
     .map(|_| ())
 }
 
-/// Schaltet die NTFS-Komprimierung auf einem offenen Handle ab – gedacht für
-/// **neu angelegte** Dateien (siehe [`create_uncompressed`]).
-/// Das Handle braucht Lese- **und** Schreibzugriff. Auf Dateisystemen ohne
-/// Komprimierung (FAT, exFAT, ReFS) ist das ein No-op: „nicht unterstützt“ und
-/// `ERROR_INVALID_PARAMETER` werden dort bewusst ignoriert.
+/// Disables NTFS compression on an open handle – intended for **newly created**
+/// files (see [`create_uncompressed`]).
+/// The handle needs read **and** write access. On file systems without
+/// compression (FAT, exFAT, ReFS) this is a no-op: "not supported" and
+/// `ERROR_INVALID_PARAMETER` are intentionally ignored there.
 ///
-/// Zum Entpacken bestehender Dateien [`remove_ntfs_compression`] verwenden – das
-/// meldet jeden Fehler.
+/// To decompress existing files use [`remove_ntfs_compression`] – it reports
+/// every error.
 pub fn disable_compression(file: &File) -> io::Result<()> {
     match set_compression_none(file) {
         Err(e) if is_unsupported(&e) => Ok(()),
@@ -512,31 +512,31 @@ pub fn disable_compression(file: &File) -> io::Result<()> {
     }
 }
 
-/// Entfernt die NTFS-Komprimierung einer Datei oder das Vererbungsflag eines Ordners.
+/// Removes the NTFS compression of a file or the inheritance flag of a folder.
 ///
-/// Anders als [`disable_compression`] wird hier nichts verschluckt: Das Element trägt
-/// nachweislich `FILE_ATTRIBUTE_COMPRESSED`, jeder Fehler ist also echt (z. B.
-/// Sparse-Konflikt). Danach wird geprüft, dass das Attribut wirklich weg ist.
+/// Unlike [`disable_compression`], nothing is swallowed here: the item verifiably
+/// carries `FILE_ATTRIBUTE_COMPRESSED`, so every error is real (e.g. a sparse
+/// conflict). Afterwards it verifies that the attribute is really gone.
 pub fn remove_ntfs_compression(path: &Path, is_dir: bool) -> io::Result<()> {
     let _ro = if is_dir { None } else { Some(ReadonlyGuard::clear(path)?) };
     set_compression_none(&open_for_modify(path, is_dir)?)?;
     if file_attributes(path)? & FILE_ATTRIBUTE_COMPRESSED != 0 {
         return Err(io::Error::other(
-            "Komprimierung nach FSCTL_SET_COMPRESSION weiterhin aktiv",
+            "compression still active after FSCTL_SET_COMPRESSION",
         ));
     }
     Ok(())
 }
 
-/// Entfernt eine WOF-Komprimierung (die Datei wird dabei entpackt).
+/// Removes a WOF compression (the file is decompressed in the process).
 pub fn remove_wof_compression(path: &Path) -> io::Result<()> {
     let _ro = ReadonlyGuard::clear(path)?;
     let file = open_for_modify(path, false)?;
     match unsafe { ioctl(&file, FSCTL_DELETE_EXTERNAL_BACKING, null(), 0, null_mut(), 0) } {
         Ok(_) => Ok(()),
-        // wof.sys entpackt die Datei, reicht das FSCTL danach aber an NTFS weiter,
-        // das mit „nicht extern gesichert“ antwortet. Zielzustand prüfen statt
-        // dem Rückgabewert zu glauben.
+        // wof.sys decompresses the file but then passes the FSCTL on to NTFS,
+        // which answers "not externally backed". Check the target state instead
+        // of trusting the return value.
         Err(e) if os_code(&e) == Some(ERROR_OBJECT_NOT_EXTERNALLY_BACKED) => {
             match wof_algorithm_of(&file)? {
                 None => Ok(()),
@@ -547,7 +547,7 @@ pub fn remove_wof_compression(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Entfernt die angegebene Komprimierungsart.
+/// Removes the given kind of compression.
 pub fn remove_compression(path: &Path, kind: CompressionKind) -> io::Result<()> {
     match kind {
         CompressionKind::Lznt1 => remove_ntfs_compression(path, false),
@@ -555,19 +555,19 @@ pub fn remove_compression(path: &Path, kind: CompressionKind) -> io::Result<()> 
     }
 }
 
-/// Legt eine Datei an (bzw. leert sie) und schaltet die Komprimierung ab,
-/// **bevor** Daten geschrieben werden – kostet < 1 ms und schützt eigene Tools
-/// vor einem komprimierten Zielordner.
+/// Creates (or truncates) a file and disables compression **before** any data
+/// is written – costs < 1 ms and protects your own tools against a compressed
+/// target folder.
 ///
 /// ```no_run
 /// use std::io::Write;
-/// let mut f = ntfs_unthrottle::create_uncompressed("D:/out/game.xci".as_ref())?;
+/// let mut f = ntfs_unthrottle::create_uncompressed("D:/out/archive.bin".as_ref())?;
 /// f.write_all(b"...")?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn create_uncompressed(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
-        .read(true) // nötig: FSCTL_SET_COMPRESSION prüft FILE_READ_DATA
+        .read(true) // required: FSCTL_SET_COMPRESSION checks FILE_READ_DATA
         .write(true)
         .create(true)
         .truncate(true)
@@ -577,47 +577,76 @@ pub fn create_uncompressed(path: &Path) -> io::Result<File> {
 }
 
 // ---------------------------------------------------------------------------
-// Fehlertexte
+// Error messages
 // ---------------------------------------------------------------------------
 
-/// Übersetzt häufige Windows-Fehler in verständliche Hinweise.
-pub fn describe_error(err: &io::Error) -> String {
-    match os_code(err) {
-        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION | ERROR_USER_MAPPED_FILE) => {
-            "Datei ist von einem anderen Prozess geöffnet/gesperrt".into()
-        }
-        Some(ERROR_ACCESS_DENIED) => {
-            "Zugriff verweigert (ACL/Systemdatei – ggf. Terminal als Administrator starten)".into()
-        }
-        Some(ERROR_DISK_FULL) => "Datenträger voll".into(),
-        Some(ERROR_FILE_SYSTEM_LIMITATION) => {
-            "NTFS-Grenze erreicht: Datei zu stark fragmentiert (vorher defragmentieren)".into()
-        }
-        Some(ERROR_INVALID_PARAMETER) => {
-            "NTFS lehnt die Änderung ab (ungültiger Parameter – z. B. Cluster > 4 KiB oder Sparse-Konflikt)"
-                .into()
-        }
-        _ => err.to_string(),
+/// Common Windows errors with a user-friendly explanation (see [`error_hint`]).
+/// Lets callers render their own (e.g. localized) messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorHint {
+    /// File is opened/locked by another process (sharing/lock violation, mapped file).
+    Locked,
+    /// Access denied (ACL, system file, missing elevation).
+    AccessDenied,
+    /// Disk full.
+    DiskFull,
+    /// `ERROR_FILE_SYSTEM_LIMITATION`: file too fragmented.
+    FileSystemLimitation,
+    /// `ERROR_INVALID_PARAMETER`: NTFS rejects the change (cluster > 4 KiB, sparse conflict).
+    InvalidParameter,
+}
+
+/// Classifies `err` into a well-known [`ErrorHint`]; `None` for anything else.
+pub fn error_hint(err: &io::Error) -> Option<ErrorHint> {
+    match os_code(err)? {
+        ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION | ERROR_USER_MAPPED_FILE => Some(ErrorHint::Locked),
+        ERROR_ACCESS_DENIED => Some(ErrorHint::AccessDenied),
+        ERROR_DISK_FULL => Some(ErrorHint::DiskFull),
+        ERROR_FILE_SYSTEM_LIMITATION => Some(ErrorHint::FileSystemLimitation),
+        ERROR_INVALID_PARAMETER => Some(ErrorHint::InvalidParameter),
+        _ => None,
     }
 }
 
-/// Wie [`describe_error`], ergänzt aber Hinweise passend zur Datei
-/// (z. B. bei virtuellen Festplatten `.vhd`/`.vhdx`).
+/// Is `path` a virtual hard disk (`.vhd`, `.vhdx`, `.avhdx`)?
+pub fn is_virtual_disk(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "vhd" | "vhdx" | "avhdx"))
+}
+
+/// Translates common Windows errors into understandable hints (English).
+pub fn describe_error(err: &io::Error) -> String {
+    match error_hint(err) {
+        Some(ErrorHint::Locked) => "file is opened/locked by another process".into(),
+        Some(ErrorHint::AccessDenied) => {
+            "access denied (ACL/system file – try running the terminal as administrator)".into()
+        }
+        Some(ErrorHint::DiskFull) => "disk full".into(),
+        Some(ErrorHint::FileSystemLimitation) => {
+            "NTFS limit reached: file is too fragmented (defragment it first)".into()
+        }
+        Some(ErrorHint::InvalidParameter) => {
+            "NTFS rejects the change (invalid parameter – e.g. cluster > 4 KiB or sparse conflict)"
+                .into()
+        }
+        None => err.to_string(),
+    }
+}
+
+/// Like [`describe_error`], but adds hints matching the file
+/// (e.g. for virtual hard disks `.vhd`/`.vhdx`).
 pub fn describe_error_at(err: &io::Error, path: &Path) -> String {
     let base = describe_error(err);
-    let is_vhd = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "vhd" | "vhdx" | "avhdx"));
-    if !is_vhd {
+    if !is_virtual_disk(path) {
         return base;
     }
-    match os_code(err) {
-        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION | ERROR_USER_MAPPED_FILE) => {
-            format!("{base} – bei .vhdx ggf. VM beenden, `wsl --shutdown` ausführen bzw. Docker schließen")
+    match error_hint(err) {
+        Some(ErrorHint::Locked) => {
+            format!("{base} – for .vhdx stop the VM, run `wsl --shutdown` or close Docker")
         }
-        Some(ERROR_FILE_SYSTEM_LIMITATION) => {
-            format!("{base} – bei .vhdx alternativ `Optimize-VHD` oder die Datei umkopieren")
+        Some(ErrorHint::FileSystemLimitation) => {
+            format!("{base} – for .vhdx use `Optimize-VHD` or copy the file instead")
         }
         _ => base,
     }
@@ -643,8 +672,8 @@ mod tests {
         let vhdx = Path::new(r"E:\VMs\disk.VHDX");
         assert!(describe_error_at(&share, vhdx).contains("wsl --shutdown"));
         assert!(describe_error_at(&limit, vhdx).contains("Optimize-VHD"));
-        assert!(describe_error_at(&limit, vhdx).contains("defragmentieren"));
-        // Andere Dateien: unverändert
+        assert!(describe_error_at(&limit, vhdx).contains("defragment"));
+        // Other files: unchanged
         let bin = Path::new(r"E:\Games\data.bin");
         assert_eq!(describe_error_at(&share, bin), describe_error(&share));
         assert_eq!(describe_error_at(&limit, bin), describe_error(&limit));
@@ -653,10 +682,22 @@ mod tests {
     #[test]
     fn invalid_parameter_tolerated_only_for_new_files() {
         let e = io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32);
-        // Tolerant nur über disable_compression (create_uncompressed) …
+        // Tolerated only via disable_compression (create_uncompressed) …
         assert!(is_unsupported(&e));
-        // … beim Entpacken wird er gemeldet – mit verständlichem Text.
-        assert!(describe_error(&e).contains("NTFS lehnt"));
+        // … when decompressing it is reported – with an understandable text.
+        assert!(describe_error(&e).contains("NTFS rejects"));
+    }
+
+    #[test]
+    fn error_hint_classification() {
+        let hint = |c: u32| error_hint(&io::Error::from_raw_os_error(c as i32));
+        assert_eq!(hint(ERROR_SHARING_VIOLATION), Some(ErrorHint::Locked));
+        assert_eq!(hint(ERROR_USER_MAPPED_FILE), Some(ErrorHint::Locked));
+        assert_eq!(hint(ERROR_ACCESS_DENIED), Some(ErrorHint::AccessDenied));
+        assert_eq!(hint(ERROR_MORE_DATA), None);
+        assert_eq!(error_hint(&io::Error::other("x")), None);
+        assert!(is_virtual_disk(Path::new(r"E:\a.AVHDX")));
+        assert!(!is_virtual_disk(Path::new(r"E:\a.vmdk")));
     }
 
     #[test]

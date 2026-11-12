@@ -1,9 +1,8 @@
-//! Nur-Lese-Abfragen für den Optimierer (`--optimize`): Datenträger, MFT,
-//! 8.3-Kurznamen und die globalen NTFS-Schalter aus der Registry.
+//! Read-only queries for the optimizer (`--optimize`): storage device, MFT,
+//! 8.3 short names and the global NTFS switches from the registry.
 //!
-//! Hier wird nichts verändert – Korrekturen laufen bewusst sichtbar über
-//! `fsutil`, damit jeder Schritt nachvollziehbar und mit Windows-Bordmitteln
-//! rückgängig zu machen ist.
+//! Nothing is modified here – fixes intentionally run visibly via `fsutil`,
+//! so every step is traceable and can be reverted with built-in Windows tools.
 
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
@@ -37,17 +36,17 @@ use crate::{ioctl, is_unsupported, to_wide};
 
 const VOLUME_IS_DIRTY: u32 = 0x1;
 
-/// Anbindung und Art des Datenträgers unter einem Volume.
+/// Bus type and kind of the storage device below a volume.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceInfo {
     pub product: Option<String>,
     pub bus: Option<&'static str>,
-    /// `Some(true)` = HDD (Kopfbewegung), `Some(false)` = SSD.
+    /// `Some(true)` = HDD (head movement), `Some(false)` = SSD.
     pub seek_penalty: Option<bool>,
     pub trim_supported: Option<bool>,
 }
 
-/// Auszug aus `NTFS_VOLUME_DATA_BUFFER`.
+/// Excerpt from `NTFS_VOLUME_DATA_BUFFER`.
 #[derive(Debug, Clone, Copy)]
 pub struct NtfsData {
     pub bytes_per_cluster: u32,
@@ -59,21 +58,21 @@ pub struct NtfsData {
 }
 
 impl NtfsData {
-    /// Anzahl der Datensätze, für die die MFT bereits Platz belegt.
+    /// Number of records the MFT already occupies space for.
     pub fn mft_records(&self) -> u64 {
         self.mft_valid_length / u64::from(self.bytes_per_record.max(1))
     }
 }
 
-/// `\\?\Volume{GUID}` (ohne abschließenden Backslash) – öffnet das Volume selbst.
+/// `\\?\Volume{GUID}` (without trailing backslash) – opens the volume itself.
 fn volume_device(root: &Path) -> io::Result<PathBuf> {
     let mut wide = to_wide(root);
-    // Die API verlangt einen abschließenden Backslash.
+    // The API requires a trailing backslash.
     if wide.len() >= 2 && wide[wide.len() - 2] != u16::from(b'\\') {
         wide.insert(wide.len() - 1, u16::from(b'\\'));
     }
     let mut buf = [0u16; 64];
-    // SAFETY: Puffer gültig, Länge in Zeichen.
+    // SAFETY: valid buffer, length in characters.
     if unsafe { GetVolumeNameForVolumeMountPointW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
         == 0
     {
@@ -84,7 +83,7 @@ fn volume_device(root: &Path) -> io::Result<PathBuf> {
     Ok(PathBuf::from(s.trim_end_matches('\\')))
 }
 
-/// Volume-Handle ohne Datenzugriff – reicht für Geräte-Abfragen, auch ohne Admin.
+/// Volume handle without data access – sufficient for device queries, even without admin.
 fn open_volume(root: &Path) -> io::Result<File> {
     OpenOptions::new()
         .access_mode(0)
@@ -100,8 +99,8 @@ fn open_root_dir(root: &Path) -> io::Result<File> {
         .open(root)
 }
 
-/// Wie [`open_root_dir`], aber ungepuffert: NTFS lehnt BypassIO-Abfragen auf
-/// Handles für gecachte I/O ab („Handles opened for cached IO not supported“).
+/// Like [`open_root_dir`], but unbuffered: NTFS rejects BypassIO queries on
+/// handles for cached I/O ("Handles opened for cached IO not supported").
 fn open_root_dir_uncached(root: &Path) -> io::Result<File> {
     OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
@@ -116,7 +115,7 @@ fn storage_query(vol: &File, id: STORAGE_PROPERTY_ID, out: &mut [u8]) -> io::Res
         QueryType: PropertyStandardQuery,
         AdditionalParameters: [0],
     };
-    // SAFETY: Ein-/Ausgabepuffer gültig für die angegebenen Längen.
+    // SAFETY: input/output buffers are valid for the given lengths.
     unsafe {
         ioctl(
             vol,
@@ -138,14 +137,17 @@ fn bus_name(bus: i32) -> &'static str {
         x if x == BusTypeSas => "SAS",
         x if x == BusTypeScsi => "SCSI",
         x if x == BusTypeRAID => "RAID",
-        x if x == BusTypeSd => "SD-Karte",
-        x if x == BusTypeSpaces => "Speicherplätze",
-        x if x == BusTypeVirtual || x == BusTypeFileBackedVirtual => "virtuell",
-        _ => "unbekannt",
+        x if x == BusTypeSd => "SD card",
+        x if x == BusTypeSpaces => "Storage Spaces",
+        x if x == BusTypeVirtual || x == BusTypeFileBackedVirtual => "virtual",
+        _ => "unknown",
     }
 }
 
-/// Anbindung (NVMe/SATA/USB …), SSD/HDD und TRIM-Fähigkeit.
+/// Bus type (NVMe/SATA/USB …), SSD/HDD and TRIM capability.
+///
+/// `bus` is a stable English identifier (`NVMe`, `SATA`, `USB`, `SD card`,
+/// `Storage Spaces`, `virtual`, `unknown`, …) suitable for comparisons.
 pub fn device_info(root: &Path) -> io::Result<DeviceInfo> {
     let vol = open_volume(root)?;
     let mut info = DeviceInfo::default();
@@ -153,7 +155,7 @@ pub fn device_info(root: &Path) -> io::Result<DeviceInfo> {
     let mut buf = vec![0u8; 1024];
     if let Ok(n) = storage_query(&vol, StorageDeviceProperty, &mut buf) {
         if n as usize >= size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
-            // SAFETY: Puffer ist groß genug; read_unaligned wegen Vec<u8>.
+            // SAFETY: the buffer is large enough; read_unaligned because of Vec<u8>.
             let d: STORAGE_DEVICE_DESCRIPTOR = unsafe { buf.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>().read_unaligned() };
             info.bus = Some(bus_name(d.BusType));
             let cstr = |off: u32| -> Option<String> {
@@ -174,26 +176,26 @@ pub fn device_info(root: &Path) -> io::Result<DeviceInfo> {
 
     let mut sp = [0u8; size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>()];
     if storage_query(&vol, StorageDeviceSeekPenaltyProperty, &mut sp).is_ok() {
-        // SAFETY: Puffer hat exakt Strukturgröße.
+        // SAFETY: the buffer has exactly the struct size.
         let d: DEVICE_SEEK_PENALTY_DESCRIPTOR = unsafe { sp.as_ptr().cast::<DEVICE_SEEK_PENALTY_DESCRIPTOR>().read_unaligned() };
         info.seek_penalty = Some(d.IncursSeekPenalty != 0);
     }
 
     let mut tr = [0u8; size_of::<DEVICE_TRIM_DESCRIPTOR>()];
     if storage_query(&vol, StorageDeviceTrimProperty, &mut tr).is_ok() {
-        // SAFETY: Puffer hat exakt Strukturgröße.
+        // SAFETY: the buffer has exactly the struct size.
         let d: DEVICE_TRIM_DESCRIPTOR = unsafe { tr.as_ptr().cast::<DEVICE_TRIM_DESCRIPTOR>().read_unaligned() };
         info.trim_supported = Some(d.TrimEnabled != 0);
     }
     Ok(info)
 }
 
-/// MFT-Größe, MFT-Zone, Clustergröße. Braucht meist Administratorrechte.
+/// MFT size, MFT zone, cluster size. Usually requires administrator rights.
 pub fn ntfs_data(root: &Path) -> io::Result<NtfsData> {
     let vol = open_volume(root)?;
-    // SAFETY: reine POD-Struktur.
+    // SAFETY: plain POD struct.
     let mut d: NTFS_VOLUME_DATA_BUFFER = unsafe { std::mem::zeroed() };
-    // SAFETY: Ausgabepuffer gültig.
+    // SAFETY: valid output buffer.
     unsafe {
         ioctl(
             &vol,
@@ -215,7 +217,7 @@ pub fn ntfs_data(root: &Path) -> io::Result<NtfsData> {
     })
 }
 
-/// Ist die 8.3-Kurznamen-Erzeugung für dieses Volume abgeschaltet (Volume-Flag)?
+/// Is 8.3 short name creation disabled for this volume (volume flag)?
 pub fn short_names_disabled_on_volume(root: &Path) -> io::Result<bool> {
     let dir = open_root_dir(root)?;
     let input = FILE_FS_PERSISTENT_VOLUME_INFORMATION {
@@ -225,7 +227,7 @@ pub fn short_names_disabled_on_volume(root: &Path) -> io::Result<bool> {
         Reserved: 0,
     };
     let mut out = input;
-    // SAFETY: Ein-/Ausgabe sind gültige Strukturen.
+    // SAFETY: input/output are valid structs.
     unsafe {
         ioctl(
             &dir,
@@ -239,11 +241,11 @@ pub fn short_names_disabled_on_volume(root: &Path) -> io::Result<bool> {
     Ok(out.VolumeFlags & PERSISTENT_VOLUME_STATE_SHORT_NAME_CREATION_DISABLED != 0)
 }
 
-/// Dirty-Bit gesetzt (chkdsk beim nächsten Start ausstehend)?
+/// Is the dirty bit set (chkdsk pending at next boot)?
 pub fn volume_dirty(root: &Path) -> io::Result<bool> {
     let vol = open_volume(root)?;
     let mut flags = 0u32;
-    // SAFETY: Ausgabepuffer gültig.
+    // SAFETY: valid output buffer.
     unsafe {
         ioctl(
             &vol,
@@ -257,13 +259,13 @@ pub fn volume_dirty(root: &Path) -> io::Result<bool> {
     Ok(flags & VOLUME_IS_DIRTY != 0)
 }
 
-/// DWORD/QWORD (Windows speichert manche Schalter als QWORD) aus `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
+/// DWORD/QWORD (Windows stores some switches as QWORD) from `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
 pub fn filesystem_reg_value(name: &str) -> Option<u64> {
     let key = to_wide(Path::new(r"SYSTEM\CurrentControlSet\Control\FileSystem"));
     let val = to_wide(Path::new(name));
     let mut data = 0u64;
     let mut len = 8u32;
-    // SAFETY: Puffer gültig, Länge in Bytes.
+    // SAFETY: valid buffer, length in bytes.
     let rc = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
@@ -282,31 +284,31 @@ pub fn filesystem_reg_value(name: &str) -> Option<u64> {
 // BypassIO (Windows 11, NTFS)
 // ---------------------------------------------------------------------------
 
-/// Ergebnis der BypassIO-Diagnose eines Volumes (nur `FS_BPIO_OP_QUERY`, ändert nichts).
+/// Result of the BypassIO diagnosis of a volume (only `FS_BPIO_OP_QUERY`, changes nothing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BypassIoStatus {
-    /// Kein Treiber legt ein Veto ein. `storage_compatible`: Speichertreiber
-    /// (z. B. `stornvme.sys`) meldet BypassIO-Fähigkeit.
+    /// No driver vetoes. `storage_compatible`: the storage driver
+    /// (e.g. `stornvme.sys`) reports BypassIO support.
     Active { storage_compatible: bool },
-    /// Filter-Stack ist frei, aber Volume-/Speicher-Stack legt ein Veto ein
-    /// (z. B. `fvevol.sys` bei BitLocker, nicht-NVMe-Treiber).
+    /// The filter stack is clear, but the volume/storage stack vetoes
+    /// (e.g. `fvevol.sys` with BitLocker, non-NVMe drivers).
     Partial { driver: String, status: u32, reason: String },
-    /// Ein Minifilter im Dateisystem-Filter-Stack blockiert BypassIO.
+    /// A minifilter in the file system filter stack blocks BypassIO.
     Blocked { driver: String, status: u32, reason: String },
-    /// `FSCTL_MANAGE_BYPASS_IO` wird nicht unterstützt (Windows 10, älterer Build).
+    /// `FSCTL_MANAGE_BYPASS_IO` is not supported (Windows 10, older build).
     Unavailable,
 }
 
-/// UTF-16-Feld mit Längenangabe in Zeichen; nicht zwingend NUL-terminiert.
+/// UTF-16 field with a length in characters; not necessarily NUL-terminated.
 fn wide_field(buf: &[u16], len_chars: u16) -> String {
     let s = &buf[..usize::from(len_chars).min(buf.len())];
     let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
     String::from_utf16_lossy(&s[..end]).trim().to_string()
 }
 
-/// Bewertet die Ergebnisse der beiden Abfragen: `filter` (nur Filter-Stack, mit
-/// `FSBPIO_INFL_SKIP_STORAGE_STACK_QUERY`) und `full` (kompletter Stack).
-/// Ein Veto erkennt man an `OpStatus != 0`.
+/// Evaluates the results of both queries: `filter` (filter stack only, with
+/// `FSBPIO_INFL_SKIP_STORAGE_STACK_QUERY`) and `full` (complete stack).
+/// A veto is indicated by `OpStatus != 0`.
 pub fn classify_bypass_io(filter: &FS_BPIO_RESULTS, full: &FS_BPIO_RESULTS, full_out_flags: i32) -> BypassIoStatus {
     let details = |r: &FS_BPIO_RESULTS| {
         (
@@ -328,8 +330,8 @@ pub fn classify_bypass_io(filter: &FS_BPIO_RESULTS, full: &FS_BPIO_RESULTS, full
     }
 }
 
-/// Eine `FS_BPIO_OP_QUERY`-Abfrage. `FS_BPIO_INPUT` hat keine Version-/Size-Felder –
-/// die Größen laufen über die Pufferlängen von `DeviceIoControl`.
+/// A single `FS_BPIO_OP_QUERY` query. `FS_BPIO_INPUT` has no version/size fields –
+/// sizes are conveyed via the buffer lengths of `DeviceIoControl`.
 fn bpio_query(dir: &File, in_flags: i32) -> io::Result<(FS_BPIO_RESULTS, i32)> {
     let input = FS_BPIO_INPUT {
         Operation: FS_BPIO_OP_QUERY,
@@ -337,9 +339,9 @@ fn bpio_query(dir: &File, in_flags: i32) -> io::Result<(FS_BPIO_RESULTS, i32)> {
         Reserved1: 0,
         Reserved2: 0,
     };
-    // SAFETY: reine POD-Struktur, Nullinitialisierung ist gültig.
+    // SAFETY: plain POD struct, zero initialization is valid.
     let mut out: FS_BPIO_OUTPUT = unsafe { std::mem::zeroed() };
-    // SAFETY: Ein-/Ausgabe sind gültige Strukturen der angegebenen Größe.
+    // SAFETY: input/output are valid structs of the given size.
     let returned = unsafe {
         ioctl(
             dir,
@@ -354,16 +356,16 @@ fn bpio_query(dir: &File, in_flags: i32) -> io::Result<(FS_BPIO_RESULTS, i32)> {
     if (returned as usize) < need {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("BypassIO: unvollständige Antwort ({returned} von {need} Bytes)"),
+            format!("BypassIO: incomplete response ({returned} of {need} bytes)"),
         ));
     }
-    // SAFETY: Bei FS_BPIO_OP_QUERY ist das Union-Feld `Query` belegt.
+    // SAFETY: for FS_BPIO_OP_QUERY the union field `Query` is populated.
     Ok((unsafe { out.Anonymous.Query }, out.OutFlags))
 }
 
-/// BypassIO-Status eines Volumes – reine Lese-Abfrage auf dem Root-Verzeichnis
-/// (`FS_BPIO_OP_QUERY` ist laut Microsoft auf Verzeichnis- und Volume-Handles erlaubt,
-/// braucht keine Administratorrechte).
+/// BypassIO status of a volume – read-only query on the root directory
+/// (per Microsoft, `FS_BPIO_OP_QUERY` is allowed on directory and volume handles
+/// and needs no administrator rights).
 pub fn bypass_io_status(root: &Path) -> io::Result<BypassIoStatus> {
     let dir = open_root_dir_uncached(root)?;
     let filter = match bpio_query(&dir, FSBPIO_INFL_SKIP_STORAGE_STACK_QUERY) {
@@ -376,17 +378,17 @@ pub fn bypass_io_status(root: &Path) -> io::Result<BypassIoStatus> {
 }
 
 // ---------------------------------------------------------------------------
-// ReFS-TRIM, fsutil-Ausgaben
+// ReFS TRIM, fsutil output
 // ---------------------------------------------------------------------------
 
-/// Konsolenausgabe (OEM-Codepage, z. B. CP850) in einen String umwandeln –
-/// sonst werden Umlaute aus fsutil-Meldungen zu `�`.
+/// Converts console output (OEM code page, e.g. CP850) into a string –
+/// otherwise non-ASCII characters in fsutil messages become `�`.
 pub fn decode_oem(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
     }
     let len = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
-    // SAFETY: Erst Länge erfragen, dann in ausreichend großen Puffer schreiben.
+    // SAFETY: first query the length, then write into a sufficiently large buffer.
     let n = unsafe { MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, null_mut(), 0) };
     if n <= 0 {
         return String::from_utf8_lossy(bytes).into_owned();
@@ -399,9 +401,9 @@ pub fn decode_oem(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&wide[..n as usize])
 }
 
-/// Wertet `fsutil behavior query DisableDeleteNotify` aus. Der Präfix
-/// `ReFS DisableDeleteNotify = N` ist in allen Sprachen gleich, nur der Rest ist
-/// lokalisiert. `Some(true)` = TRIM deaktiviert. „Nicht gesetzt“ → `None`.
+/// Parses `fsutil behavior query DisableDeleteNotify`. The prefix
+/// `ReFS DisableDeleteNotify = N` is identical in all Windows languages, only the
+/// rest is localized. `Some(true)` = TRIM disabled. "Not set" → `None`.
 pub fn parse_refs_ddn(out: &str) -> Option<bool> {
     let line = out
         .lines()
@@ -412,8 +414,8 @@ pub fn parse_refs_ddn(out: &str) -> Option<bool> {
     Some(digit != 0)
 }
 
-/// Ist TRIM für ReFS (Dev Drives) global abgeschaltet? Zuerst die Registry
-/// (`RefsDisableDeleteNotification`), fehlt der Wert, `fsutil` (nur Lesen).
+/// Is TRIM globally disabled for ReFS (Dev Drives)? Checks the registry first
+/// (`RefsDisableDeleteNotification`); if the value is missing, `fsutil` (read-only).
 pub fn refs_trim_disabled() -> Option<bool> {
     if let Some(v) = filesystem_reg_value("RefsDisableDeleteNotification") {
         return Some(v != 0);
@@ -430,7 +432,7 @@ mod tests {
     use super::*;
 
     fn results(status: u32, driver: &str, reason: &str) -> FS_BPIO_RESULTS {
-        // SAFETY: reine POD-Struktur.
+        // SAFETY: plain POD struct.
         let mut r: FS_BPIO_RESULTS = unsafe { std::mem::zeroed() };
         r.OpStatus = status;
         for (i, c) in driver.encode_utf16().enumerate() {
@@ -474,7 +476,7 @@ mod tests {
     fn bypass_io_blocked_by_filter_wins() {
         let wof = results(VETO, "wof.sys", "The specified minifilter does not support bypass IO.");
         let BypassIoStatus::Blocked { driver, .. } = classify_bypass_io(&wof, &wof, 0) else {
-            panic!("erwartet Blocked");
+            panic!("expected Blocked");
         };
         assert_eq!(driver, "wof.sys");
     }
@@ -482,11 +484,11 @@ mod tests {
     #[test]
     fn wide_field_is_bounded_and_not_nul_dependent() {
         let r = results(VETO, "abc.sys", "");
-        // Länge kürzer als Inhalt → nur so viele Zeichen
+        // Length shorter than content → only that many characters
         assert_eq!(wide_field(&r.FailingDriverName, 3), "abc");
-        // Länge größer als Puffer → gekappt, abschließende NULs ignoriert
+        // Length larger than buffer → capped, trailing NULs ignored
         assert_eq!(wide_field(&r.FailingDriverName, 999), "abc.sys");
-        // Voller Puffer ohne NUL
+        // Full buffer without NUL
         let full = [u16::from(b'x'); 32];
         assert_eq!(wide_field(&full, 32).len(), 32);
     }
