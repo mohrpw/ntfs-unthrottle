@@ -22,14 +22,15 @@ use walkdir::WalkDir;
 use i18n::{tr, LangChoice};
 use ntfs_unthrottle::{
     compressed_ancestors, display_path, file_identity_of, fragment_count,
-    fragment_count_of, open_for_query, physical_size, remove_compression, remove_ntfs_compression,
-    volume_info, wof_algorithm_of, CompressionKind, VolumeInfo, WofAlgorithm,
+    fragment_count_of, is_system_drive_root, open_for_query, physical_size, remove_compression,
+    remove_ntfs_compression, volume_info, wof_algorithm_of, CompressionKind, VolumeInfo,
+    WofAlgorithm,
 };
 use ntfs_unthrottle::tune::{device_info, DeviceInfo};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_OFFLINE,
-    FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE, FILE_ATTRIBUTE_SYSTEM,
 };
 
 /// Placeholders of OneDrive & co. – opening them with write access would download them.
@@ -364,10 +365,12 @@ impl Candidate {
 #[derive(Default)]
 struct Scan {
     dirs: Vec<PathBuf>,
+    flagged_vol_roots: Vec<PathBuf>,
     files: Vec<Candidate>,
     entries: u64,
     errors: u64,
     cloud_skipped: u64,
+    sparse_skipped: u64,
     excluded: Vec<PathBuf>,
     kept_files: u64,
     kept_bytes_saved: u64,
@@ -496,6 +499,25 @@ const ENGINE_DIRS: &[&str] = &[
     "shipping", "retail", "windows", "windowsnoeditor", "redist", "thirdparty", "directstorage",
     "engine", "plugins", "content",
 ];
+
+/// Routes a compressed directory either to `dirs` (normal folders, including a
+/// non-root scan path at depth 0) or to `flagged_vol_roots` (volume roots,
+/// which are never modified automatically).
+fn record_compressed_dir(
+    path: PathBuf,
+    vol_root: Option<&Path>,
+    sysdrive: &str,
+    dirs: &mut Vec<PathBuf>,
+    flagged_vol_roots: &mut Vec<PathBuf>,
+) {
+    if is_vol_root(&path, vol_root) {
+        if !is_system_drive_root(&path, sysdrive) {
+            flagged_vol_roots.push(path);
+        }
+    } else {
+        dirs.push(path);
+    }
+}
 
 /// Volume root or mount point reached?
 fn is_vol_root(cur: &Path, vol_root: Option<&Path>) -> bool {
@@ -762,7 +784,11 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     print_report(cli, &scan, &notes, started.elapsed());
 
     let ancestors: Vec<PathBuf> = {
-        let mut v: Vec<PathBuf> = roots.iter().flat_map(|r| compressed_ancestors(r)).collect();
+        let mut v: Vec<PathBuf> = roots
+            .iter()
+            .flat_map(|r| compressed_ancestors(r))
+            .chain(scan.flagged_vol_roots.iter().cloned())
+            .collect();
         v.sort();
         v.dedup();
         v
@@ -902,6 +928,7 @@ fn scan_tree(
     let min_bytes = cli.min_size.saturating_mul(1024 * 1024);
     // exFAT/FAT/ReFS have no wof.sys – no per-file FSCTL queries there.
     let skip_wof = cli.no_wof || !info.wof_possible();
+    let sysdrive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
 
     // filter_entry also prevents descending into excluded folders.
     let excluded = std::cell::RefCell::new(Vec::new());
@@ -944,11 +971,23 @@ fn scan_tree(
         if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             continue;
         }
+        // Sparse files must not be uncompressed blindly: FSCTL_SET_COMPRESSION(NONE)
+        // can fail with ERROR_INVALID_PARAMETER or materialize sparse zero ranges on disk.
+        if attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0 {
+            scan.sparse_skipped += 1;
+            continue;
+        }
         let ntfs_compressed = attrs & FILE_ATTRIBUTE_COMPRESSED != 0;
 
         if meta.is_dir() {
             if ntfs_compressed {
-                scan.dirs.push(entry.into_path());
+                record_compressed_dir(
+                    entry.into_path(),
+                    info.vol_root(),
+                    &sysdrive,
+                    &mut scan.dirs,
+                    &mut scan.flagged_vol_roots,
+                );
             }
             continue;
         }
@@ -1177,6 +1216,9 @@ fn print_report(cli: &Cli, scan: &Scan, notes: &StorageNotes, took: Duration) {
     }
     if scan.cloud_skipped > 0 {
         row(l.lbl_cloud_skipped(), scan.cloud_skipped);
+    }
+    if scan.sparse_skipped > 0 {
+        row(l.lbl_sparse_skipped(), scan.sparse_skipped);
     }
     if !scan.excluded.is_empty() {
         let names: Vec<String> = scan
@@ -1480,5 +1522,30 @@ mod tests {
             group_dir(Path::new(r"E:\Games"), Path::new(r"E:\Games\Shared\a")),
             group_dir(Path::new(r"E:\Backup"), Path::new(r"E:\Backup\Shared\a"))
         );
+    }
+
+    #[test]
+    fn compressed_dir_skips_drive_root_but_keeps_subfolders() {
+        let mut dirs = Vec::new();
+        let mut roots = Vec::new();
+        // Drive root E:\ must not be added to auto-modified dirs.
+        record_compressed_dir(p(r"\\?\E:\"), Some(Path::new(r"E:\")), "C:", &mut dirs, &mut roots);
+        assert!(dirs.is_empty());
+        assert_eq!(roots, vec![p(r"\\?\E:\")]);
+
+        // System drive root C:\ is excluded from both.
+        record_compressed_dir(p(r"\\?\C:\"), Some(Path::new(r"C:\")), "C:", &mut dirs, &mut roots);
+        assert!(dirs.is_empty());
+        assert_eq!(roots, vec![p(r"\\?\E:\")]);
+
+        // Normal subfolder (even as scan root at depth 0) IS queued in dirs.
+        record_compressed_dir(
+            p(r"\\?\E:\Games"),
+            Some(Path::new(r"E:\")),
+            "C:",
+            &mut dirs,
+            &mut roots,
+        );
+        assert_eq!(dirs, vec![p(r"\\?\E:\Games")]);
     }
 }

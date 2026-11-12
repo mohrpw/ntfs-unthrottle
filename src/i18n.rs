@@ -573,6 +573,13 @@ impl Lang {
         }
     }
 
+    pub fn lbl_sparse_skipped(self) -> &'static str {
+        match self {
+            Lang::En => "Sparse files skipped:",
+            Lang::De => "Sparse-Dateien übersprungen:",
+        }
+    }
+
     pub fn lbl_excluded(self) -> &'static str {
         match self {
             Lang::En => "Excluded:",

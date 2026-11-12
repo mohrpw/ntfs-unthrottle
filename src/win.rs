@@ -16,13 +16,14 @@ use windows_sys::Win32::Foundation::{
     ERROR_SHARING_VIOLATION, ERROR_USER_MAPPED_FILE, HANDLE, NO_ERROR, SetLastError,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle,
-    GetVolumeInformationW, GetVolumePathNameW, BY_HANDLE_FILE_INFORMATION, SetFileAttributesW, COMPRESSION_FORMAT_NONE, FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_READONLY, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_PROVIDER_COMPRESSION_LZX, FILE_PROVIDER_COMPRESSION_XPRESS16K,
-    FILE_PROVIDER_COMPRESSION_XPRESS4K, FILE_PROVIDER_COMPRESSION_XPRESS8K, FILE_WRITE_DATA,
-    INVALID_FILE_ATTRIBUTES, WOF_PROVIDER_FILE,
+    BY_HANDLE_FILE_INFORMATION, COMPRESSION_FORMAT_NONE, FILE_ATTRIBUTE_COMPRESSED,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_PROVIDER_COMPRESSION_LZX,
+    FILE_PROVIDER_COMPRESSION_XPRESS16K, FILE_PROVIDER_COMPRESSION_XPRESS4K,
+    FILE_PROVIDER_COMPRESSION_XPRESS8K, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, GetCompressedFileSizeW,
+    GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle, GetVolumeInformationW,
+    GetVolumePathNameW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW, WOF_PROVIDER_FILE,
 };
 use windows_sys::Win32::System::Ioctl::{
     FILE_PROVIDER_EXTERNAL_INFO_V1, FSCTL_DELETE_EXTERNAL_BACKING, FSCTL_GET_EXTERNAL_BACKING,
@@ -135,7 +136,8 @@ fn open_for_modify(path: &Path, is_dir: bool) -> io::Result<File> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     if is_dir {
         // On Windows, directory handles only exist with backup semantics.
-        opts.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        // Never follow directory symlinks/junctions onto external targets.
+        opts.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
     opts.open(path)
 }
@@ -280,19 +282,29 @@ impl FileIdentity {
     }
 }
 
-/// Volume serial number, file index and link count of an open handle.
-pub fn file_identity_of(file: &File) -> io::Result<FileIdentity> {
+fn by_handle_file_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     // SAFETY: plain POD struct, zero initialization is valid.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: valid handle, pointer to a sufficiently large struct.
     if unsafe { GetFileInformationByHandle(raw_handle(file), &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(info)
+}
+
+/// Volume serial number, file index and link count of an open handle.
+pub fn file_identity_of(file: &File) -> io::Result<FileIdentity> {
+    let info = by_handle_file_info(file)?;
     Ok(FileIdentity {
         volume_serial: info.dwVolumeSerialNumber,
         index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         links: info.nNumberOfLinks,
     })
+}
+
+/// File attributes of an already open handle (`GetFileInformationByHandle`).
+pub fn file_attributes_of(file: &File) -> io::Result<u32> {
+    Ok(by_handle_file_info(file)?.dwFileAttributes)
 }
 
 /// Determines volume root, file system and free space for a path.
@@ -452,6 +464,16 @@ pub fn disable_compression(file: &File) -> io::Result<()> {
     }
 }
 
+fn clear_compression_and_verify(file: &File) -> io::Result<()> {
+    set_compression_none(file)?;
+    if file_attributes_of(file)? & FILE_ATTRIBUTE_COMPRESSED != 0 {
+        return Err(io::Error::other(
+            "compression still active after FSCTL_SET_COMPRESSION",
+        ));
+    }
+    Ok(())
+}
+
 /// Removes the NTFS compression of a file or the inheritance flag of a folder.
 ///
 /// Unlike [`disable_compression`], nothing is swallowed here: the item verifiably
@@ -459,13 +481,14 @@ pub fn disable_compression(file: &File) -> io::Result<()> {
 /// conflict). Afterwards it verifies that the attribute is really gone.
 pub fn remove_ntfs_compression(path: &Path, is_dir: bool) -> io::Result<()> {
     let _ro = if is_dir { None } else { Some(ReadonlyGuard::clear(path)?) };
-    set_compression_none(&open_for_modify(path, is_dir)?)?;
-    if file_attributes(path)? & FILE_ATTRIBUTE_COMPRESSED != 0 {
-        return Err(io::Error::other(
-            "compression still active after FSCTL_SET_COMPRESSION",
+    let file = open_for_modify(path, is_dir)?;
+    if is_dir && file_attributes_of(&file)? & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to modify reparse point directory",
         ));
     }
-    Ok(())
+    clear_compression_and_verify(&file)
 }
 
 /// Removes a WOF compression (the file is decompressed in the process).
@@ -543,13 +566,21 @@ fn has_compressed_attr(file: &File) -> bool {
 /// Clears the compression flag of a folder if it is set, so that files and
 /// subfolders created there afterwards are no longer compressed. Existing
 /// files inside are not touched. Returns `Ok(true)` if the flag was cleared,
-/// `Ok(false)` if it was not set.
+/// `Ok(false)` if it was not set (or if `dir` is a symlink/junction/reparse point).
 pub fn clear_dir_compression<P: AsRef<Path>>(dir: P) -> io::Result<bool> {
     let dir = dir.as_ref();
-    if file_attributes(dir)? & FILE_ATTRIBUTE_COMPRESSED == 0 {
+    let pre = file_attributes(dir)?;
+    if pre & FILE_ATTRIBUTE_REPARSE_POINT != 0 || pre & FILE_ATTRIBUTE_COMPRESSED == 0 {
         return Ok(false);
     }
-    remove_ntfs_compression(dir, true)?;
+    // Re-check directly on the handle opened with FILE_FLAG_OPEN_REPARSE_POINT
+    // so a concurrent swap to a junction/symlink cannot affect an external target.
+    let file = open_for_modify(dir, true)?;
+    let attrs = file_attributes_of(&file)?;
+    if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attrs & FILE_ATTRIBUTE_COMPRESSED == 0 {
+        return Ok(false);
+    }
+    clear_compression_and_verify(&file)?;
     Ok(true)
 }
 
@@ -568,11 +599,14 @@ pub fn create_dir_all_uncompressed<P: AsRef<Path>>(path: P) -> io::Result<()> {
         // Same error as std.
         return fs::create_dir_all(path);
     }
-    // Missing folders, deepest first. `try_exists` instead of `exists`: on
-    // permission/I/O errors an existing folder must not be treated as new.
+    // Missing folders, deepest first. `symlink_metadata` instead of `exists`: on
+    // permission/I/O errors or dangling junctions an existing entry must not be treated as new.
     let missing: Vec<&Path> = path
         .ancestors()
-        .take_while(|p| !p.as_os_str().is_empty() && matches!(p.try_exists(), Ok(false)))
+        .take_while(|p| {
+            !p.as_os_str().is_empty()
+                && matches!(fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        })
         .collect();
     for dir in missing.iter().rev() {
         match fs::create_dir(dir) {
@@ -857,6 +891,30 @@ mod tests {
         let Some(dir) = compressed_temp_dir("cdc2") else { return };
         assert!(clear_dir_compression(&dir.0).unwrap());
         assert!(!is_compressed(&dir.0));
+    }
+
+    #[test]
+    fn clear_dir_compression_does_not_follow_junctions() {
+        let Some(target) = compressed_temp_dir("junc-target") else { return };
+        let parent = TempDir::new("junc-parent");
+        let link = parent.0.join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target.0)
+            .output();
+        let Ok(out) = status else { return };
+        if !out.status.success() {
+            return;
+        }
+        assert!(!clear_dir_compression(&link).unwrap());
+        create_dir_all_uncompressed(&link).unwrap();
+        // Target outside the junction path must retain its compression flag.
+        assert!(is_compressed(&target.0));
+        // remove_ntfs_compression must refuse a directory reparse point.
+        assert!(remove_ntfs_compression(&link, true).is_err());
+        assert!(is_compressed(&target.0));
+        let _ = fs::remove_dir(&link);
     }
 
     #[test]
