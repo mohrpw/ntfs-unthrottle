@@ -59,6 +59,7 @@ ntfs-unthrottle C:\code --all --min-size 0 --fix
 | `--min-size <MiB>` | Mindestgröße für Dateien (Standard 16) |
 | `--threshold <%>` | Ab dieser physischen Quote gilt Komprimierung als nutzlos (Standard 90) |
 | `--all` | Jede komprimierte Datei ab Mindestgröße erfassen |
+| `--optimize` | Optimierer: Volume-Einstellungen prüfen (mit `--fix` anwenden), scannt keine Dateien |
 | `--recommended` | Empfohlene Auswahl (siehe unten), Alias `--recommend`; nicht mit `--all` kombinierbar |
 | `--keep-dir-flags` | Ordner-Flags nicht entfernen |
 | `--no-wof` | WOF-Erkennung überspringen (spart ein Öffnen pro großer Datei) |
@@ -85,6 +86,31 @@ behalten ihre Platzersparnis.
 ```powershell
 ntfs-unthrottle E:\ --recommended          # ansehen
 ntfs-unthrottle E:\ --recommended --fix    # anwenden
+```
+
+### `--optimize` – Volume- und NTFS-Einstellungen
+
+Prüft für die Volumes der angegebenen Pfade, was Datei-I/O unabhängig von der
+Komprimierung bremst:
+
+| Prüfung | Automatische Korrektur (`--fix`, als Administrator) |
+|---|---|
+| Datenträger: NVMe/SATA/USB, SSD/HDD, TRIM, QLC-Modelle | – (Hinweis) |
+| Freier Platz < 10 % | – (Hinweis) |
+| MFT-Größe, Datensätze, Fragmente, MFT-Zone | `fsutil behavior set mftzone 2` bei ≥ 2 Mio. Datensätzen |
+| 8.3-Kurznamen pro Volume | `fsutil 8dot3name set E: 1` (nie auf dem Systemlaufwerk) |
+| Last-Access-Zeitstempel | `fsutil behavior set disablelastaccess 1` |
+| TRIM bei SSDs | `fsutil behavior set DisableDeleteNotify NTFS 0` |
+| Dirty-Bit | – (Hinweis auf `chkdsk E: /scan`) |
+
+Bewusst **nicht** automatisch: `8dot3name strip` (kann Programme brechen, die
+Kurznamen in der Registry gespeichert haben), Defender-Ausnahmen, Defragmentierung
+und chkdsk. Alle Korrekturen laufen sichtbar über `fsutil` und lassen sich damit auch
+wieder zurücksetzen.
+
+```powershell
+ntfs-unthrottle E:\ --optimize          # prüfen (ohne Admin eingeschränkt)
+ntfs-unthrottle E:\ --optimize --fix    # anwenden (Terminal als Administrator)
 ```
 
 ### Geschützte Systempfade (Poka-Yoke)

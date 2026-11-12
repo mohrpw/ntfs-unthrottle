@@ -14,9 +14,12 @@ use console::style;
 use humansize::{format_size, BINARY};
 
 use ntfs_unthrottle::tune::{
-    device_info, filesystem_reg_dword, ntfs_data, short_names_disabled_on_volume, volume_dirty,
+    device_info, filesystem_reg_value, ntfs_data, short_names_disabled_on_volume, volume_dirty,
 };
 use ntfs_unthrottle::{display_path, fragment_count, volume_info};
+
+/// Bekannte QLC-SSD-Familien: Nach dem SLC-Cache bricht die Schreibrate ein.
+const QLC_MODELS: &[&str] = &["QVO", "660P", "670P", "CT500P1", "CT1000P1", "CT2000P1", "P2 ", "NV2"];
 
 /// Ab so vielen MFT-Datensätzen lohnt eine größere MFT-Zone.
 const LARGE_MFT_RECORDS: u64 = 2_000_000;
@@ -74,7 +77,7 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
     }
 
     let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_lowercase();
-    let reg_8dot3 = filesystem_reg_dword("NtfsDisable8dot3NameCreation");
+    let reg_8dot3 = filesystem_reg_value("NtfsDisable8dot3NameCreation");
     let mut plan = Plan::default();
     let mut any_ssd = false;
     let mut any_large_mft = false;
@@ -113,6 +116,13 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
                 );
                 if d.seek_penalty == Some(false) {
                     any_ssd = true;
+                }
+                let product = d.product.as_deref().unwrap_or("").to_uppercase();
+                if QLC_MODELS.iter().any(|m| product.contains(m)) {
+                    plan.hints.push(format!(
+                        "{vol} ist eine QLC-SSD ({}). Nach einigen GiB am Stück ist ihr SLC-Cache voll, dann fällt die Schreibrate auf HDD-Niveau – das ist Hardware, kein Einstellungsproblem. Große Entpack-/Kopierjobs besser auf einer TLC/NVMe-SSD ausführen und erst danach verschieben; mehr freier Platz vergrößert den Cache.",
+                        d.product.as_deref().unwrap_or("?")
+                    ));
                 }
                 match (d.seek_penalty, d.bus) {
                     (Some(true), _) => {
@@ -235,7 +245,7 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
 
     // --- Globale Schalter --------------------------------------------------
     println!("{}", style("[Global]").bold());
-    match filesystem_reg_dword("NtfsDisableLastAccessUpdate") {
+    match filesystem_reg_value("NtfsDisableLastAccessUpdate") {
         Some(v) if v & 1 == 1 => ok("Last-Access:", "aus"),
         _ => {
             warn("Last-Access:", "aktiv – jeder Lesezugriff schreibt einen Zeitstempel");
@@ -247,7 +257,7 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
         }
     }
     if any_ssd {
-        match filesystem_reg_dword("DisableDeleteNotification") {
+        match filesystem_reg_value("DisableDeleteNotification") {
             Some(1) => {
                 warn("TRIM:", "deaktiviert – die SSD wird mit der Zeit langsamer");
                 plan.fix(
@@ -259,7 +269,8 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool) -> io::Result<ExitCode> {
             _ => ok("TRIM:", "aktiv"),
         }
     }
-    let zone = filesystem_reg_dword("NtfsMftZoneReservation").unwrap_or(1);
+    // 0 bzw. fehlend = Standard (Stufe 1).
+    let zone = filesystem_reg_value("NtfsMftZoneReservation").unwrap_or(0).max(1);
     if any_large_mft && zone < 2 {
         warn("MFT-Zone:", format!("Stufe {zone} – zu klein für Volumes mit Millionen Dateien"));
         plan.fix(

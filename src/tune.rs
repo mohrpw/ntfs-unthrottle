@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Ioctl::{
     PERSISTENT_VOLUME_STATE_SHORT_NAME_CREATION_DISABLED, STORAGE_DEVICE_DESCRIPTOR,
     STORAGE_PROPERTY_ID, STORAGE_PROPERTY_QUERY,
 };
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_QWORD};
 
 use crate::{ioctl, to_wide};
 
@@ -244,21 +244,21 @@ pub fn volume_dirty(root: &Path) -> io::Result<bool> {
     Ok(flags & VOLUME_IS_DIRTY != 0)
 }
 
-/// DWORD aus `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
-pub fn filesystem_reg_dword(name: &str) -> Option<u32> {
+/// DWORD/QWORD (Windows speichert manche Schalter als QWORD) aus `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`.
+pub fn filesystem_reg_value(name: &str) -> Option<u64> {
     let key = to_wide(Path::new(r"SYSTEM\CurrentControlSet\Control\FileSystem"));
     let val = to_wide(Path::new(name));
-    let mut data = 0u32;
-    let mut len = 4u32;
+    let mut data = 0u64;
+    let mut len = 8u32;
     // SAFETY: Puffer gültig, Länge in Bytes.
     let rc = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
             key.as_ptr(),
             val.as_ptr(),
-            RRF_RT_REG_DWORD,
+            RRF_RT_REG_DWORD | RRF_RT_REG_QWORD,
             null_mut(),
-            (&mut data as *mut u32).cast(),
+            (&mut data as *mut u64).cast(),
             &mut len,
         )
     };
