@@ -25,7 +25,7 @@ use crate::i18n::{tr, DriverHint};
 use crate::put_path;
 
 /// Known QLC SSD families: once the SLC cache is full, the write rate collapses.
-const QLC_MODELS: &[&str] = &["QVO", "660P", "670P", "CT500P1", "CT1000P1", "CT2000P1", "P2 ", "NV2"];
+pub(crate) const QLC_MODELS: &[&str] = &["QVO", "660P", "670P", "CT500P1", "CT1000P1", "CT2000P1", "P2 ", "NV2"];
 
 /// From this many MFT records on, a larger MFT zone pays off.
 const LARGE_MFT_RECORDS: u64 = 2_000_000;

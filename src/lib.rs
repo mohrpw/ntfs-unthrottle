@@ -123,6 +123,29 @@ pub enum WofAlgorithm {
     Unknown(u32),
 }
 
+impl WofAlgorithm {
+    /// Uncompressed chunk size in bytes used by WOF for this algorithm.
+    pub fn chunk_size(self) -> Option<u32> {
+        match self {
+            Self::Xpress4K => Some(4096),
+            Self::Xpress8K => Some(8192),
+            Self::Xpress16K => Some(16384),
+            Self::Lzx => Some(32768),
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
+/// Outcome of [`compress_wof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WofCompressOutcome {
+    /// The file was compressed using the requested WOF algorithm.
+    Compressed,
+    /// The kernel declined compression (`ERROR_COMPRESSION_NOT_BENEFICIAL`)
+    /// because the compressed representation would not save space.
+    NotBeneficial,
+}
+
 impl fmt::Display for WofAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
