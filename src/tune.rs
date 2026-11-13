@@ -12,7 +12,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_SUCCESS, NO_ERROR};
 use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP};
 use windows_sys::Win32::Storage::FileSystem::{
     GetVolumeNameForVolumeMountPointW, BusTypeAta, BusTypeFileBackedVirtual, BusTypeNvme,
@@ -34,7 +34,8 @@ use windows_sys::Win32::System::Ioctl::{
 };
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_QWORD};
 
-use crate::{file_attributes, ioctl, is_unsupported, to_wide};
+use crate::win::SystemDll;
+use crate::{display_path, file_attributes, ioctl, is_unsupported, to_wide, WofAlgorithm};
 
 const VOLUME_IS_DIRTY: u32 = 0x1;
 
@@ -493,6 +494,34 @@ pub fn refs_trim_disabled() -> Option<bool> {
     parse_refs_ddn(&decode_oem(&out.stdout))
 }
 
+/// Queries Windows' `WofShouldCompressBinaries` in `wofutil.dll` (loaded dynamically
+/// from System32). Returns `None` if the DLL/export is unavailable or the query fails.
+pub fn wof_should_compress_binaries(volume_root: &Path) -> Option<(bool, Option<WofAlgorithm>)> {
+    type Fn = unsafe extern "system" fn(*const u16, *mut u32) -> i32;
+    let dll = SystemDll::load("wofutil.dll")?;
+    let proc_ptr = dll.proc(c"WofShouldCompressBinaries")?;
+    // SAFETY: `WofShouldCompressBinaries` matches `(LPCWSTR, PULONG) -> BOOL`.
+    let func: Fn = unsafe { std::mem::transmute(proc_ptr) };
+
+    let mut path_str = display_path(volume_root);
+    if !path_str.ends_with('\\') {
+        path_str.push('\\');
+    }
+    let wide = to_wide(Path::new(&path_str));
+    let mut raw_alg = 0u32;
+    // SAFETY: clears thread-local last error before probing `WofShouldCompressBinaries`.
+    unsafe { SetLastError(NO_ERROR) };
+    // SAFETY: `wide` is NUL-terminated and `raw_alg` is valid writable storage.
+    let should = unsafe { func(wide.as_ptr(), &mut raw_alg) };
+    if should != 0 {
+        Some((true, Some(WofAlgorithm::from_raw(raw_alg))))
+    } else {
+        // SAFETY: reads thread-local last error set by `WofShouldCompressBinaries`.
+        let err = unsafe { GetLastError() };
+        (err == NO_ERROR).then_some((false, None))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +626,6 @@ mod tests {
         let _ = dev_drive_info(&sys);
         let idx = indexer_status(&sys);
         assert!(idx.root_not_indexed.is_some());
+        let _ = wof_should_compress_binaries(&sys);
     }
 }

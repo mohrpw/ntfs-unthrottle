@@ -1244,6 +1244,194 @@ impl Lang {
             Lang::De => format!("{n} Korrektur(en) fehlgeschlagen – meist fehlen Administratorrechte."),
         }
     }
+
+    // --- Compact (per-file WOF compression) ----------------------------------
+
+    pub fn compact_non_ntfs_skipped(self, fs: impl Display) -> String {
+        match self {
+            Lang::En => format!("File system {fs}: WOF compression is only supported on NTFS – skipped."),
+            Lang::De => format!("Dateisystem {fs}: WOF-Komprimierung wird nur auf NTFS unterstützt – übersprungen."),
+        }
+    }
+
+    pub fn compact_profile_line(self, req: &str, eff: &str, qlc_auto: bool) -> String {
+        match (self, qlc_auto) {
+            (Lang::En, true) => format!("Profile: {req} → {eff} (QLC SSD < 20% free)"),
+            (Lang::De, true) => format!("Profil: {req} → {eff} (QLC-SSD < 20 % frei)"),
+            (Lang::En, false) => format!("Profile: {req} → {eff}"),
+            (Lang::De, false) => format!("Profil: {req} → {eff}"),
+        }
+    }
+
+    pub fn compact_nothing_found(self) -> &'static str {
+        match self {
+            Lang::En => "No files suitable for WOF compression found.",
+            Lang::De => "Keine passenden Dateien für WOF-Komprimierung gefunden.",
+        }
+    }
+
+    pub fn compact_analysis_only(self, flag: impl Display) -> String {
+        match self {
+            Lang::En => format!("Dry-run only. Use {flag} to apply WOF compression."),
+            Lang::De => format!("Nur Dry-Run. Mit {flag} wird die WOF-Komprimierung angewendet."),
+        }
+    }
+
+    pub fn compact_confirm(self, files: usize, est_saved: impl Display) -> String {
+        let yn = self.yes_no();
+        match self {
+            Lang::En => format!("▶ Compress {files} file(s) with WOF (est. saving {est_saved}) now? {yn}:"),
+            Lang::De => format!("▶ {files} Datei(en) jetzt mit WOF komprimieren (geschätzte Ersparnis {est_saved})? {yn}:"),
+        }
+    }
+
+    pub fn compact_compressing(self) -> &'static str {
+        match self {
+            Lang::En => "Compressing …",
+            Lang::De => "Komprimiere …",
+        }
+    }
+
+    pub fn compact_lbl_candidates(self) -> &'static str {
+        match self {
+            Lang::En => "Compression candidates:",
+            Lang::De => "Komprimierungs-Kandidaten:",
+        }
+    }
+
+    pub fn compact_lbl_est_savings(self) -> &'static str {
+        match self {
+            Lang::En => "Estimated physical savings:",
+            Lang::De => "Geschätzte physische Ersparnis:",
+        }
+    }
+
+    pub fn compact_est_savings_val(self, saved: impl Display, pct: f64, clusters: u64) -> String {
+        match self {
+            Lang::En => format!("{saved} ({pct:.1} %, {clusters} clusters)"),
+            Lang::De => format!("{saved} ({pct:.1} %, {clusters} Cluster)"),
+        }
+    }
+
+    pub fn compact_lbl_already_wof(self) -> &'static str {
+        match self {
+            Lang::En => "Already WOF-compressed:",
+            Lang::De => "Bereits WOF-komprimiert:",
+        }
+    }
+
+    pub fn compact_lbl_ds_skipped(self) -> &'static str {
+        match self {
+            Lang::En => "DirectStorage on NVMe skipped:",
+            Lang::De => "DirectStorage auf NVMe übersprungen:",
+        }
+    }
+
+    pub fn compact_lbl_packed_skipped(self) -> &'static str {
+        match self {
+            Lang::En => "Packed executables skipped:",
+            Lang::De => "Gepackte Executables übersprungen:",
+        }
+    }
+
+    pub fn compact_lbl_encrypted_skipped(self) -> &'static str {
+        match self {
+            Lang::En => "EFS-encrypted files skipped:",
+            Lang::De => "EFS-verschlüsselte Dateien übersprungen:",
+        }
+    }
+
+    pub fn compact_lbl_hardlinks_skipped(self) -> &'static str {
+        match self {
+            Lang::En => "Hardlinked files skipped:",
+            Lang::De => "Hardlink-Dateien übersprungen:",
+        }
+    }
+
+    pub fn compact_lbl_unbeneficial(self) -> &'static str {
+        match self {
+            Lang::En => "Skipped (low gain / policy):",
+            Lang::De => "Übersprungen (kaum Gewinn / Profil):",
+        }
+    }
+
+    pub fn compact_lbl_excluded_type(self) -> &'static str {
+        match self {
+            Lang::En => "Excluded (type/build/cache):",
+            Lang::De => "Ausgeschlossen (Typ/Build/Cache):",
+        }
+    }
+
+    pub fn compact_lbl_small_skipped(self, min_kib: u64) -> String {
+        match self {
+            Lang::En => format!("Below {min_kib} KiB / 1 cluster:"),
+            Lang::De => format!("Unter {min_kib} KiB / 1 Cluster:"),
+        }
+    }
+
+    pub fn compact_alg_group_header(self) -> &'static str {
+        match self {
+            Lang::En => "Planned WOF compression by algorithm:",
+            Lang::De => "Geplante WOF-Komprimierung nach Algorithmus:",
+        }
+    }
+
+    pub fn compact_alg_group_line(
+        self,
+        files: usize,
+        logical: impl Display,
+        est_phys: impl Display,
+        saved: impl Display,
+        clusters: u64,
+    ) -> String {
+        match self {
+            Lang::En => format!("{files} file(s): {logical} → ~{est_phys} (saves ~{saved}, {clusters} clusters)"),
+            Lang::De => format!("{files} Datei(en): {logical} → ~{est_phys} (spart ~{saved}, {clusters} Cluster)"),
+        }
+    }
+
+    /// Column headers: logical size, est. ratio, target algorithm, est. savings, path.
+    pub fn compact_table_columns(self) -> [&'static str; 5] {
+        match self {
+            Lang::En => ["Size", "est.", "Algorithm", "Saves", "Path"],
+            Lang::De => ["Größe", "gesch.", "Algorithmus", "Ersparnis", "Pfad"],
+        }
+    }
+
+    pub fn compact_result_compressed(self) -> &'static str {
+        match self {
+            Lang::En => "Files WOF-compressed:",
+            Lang::De => "Dateien WOF-komprimiert:",
+        }
+    }
+
+    pub fn compact_result_not_beneficial(self) -> &'static str {
+        match self {
+            Lang::En => "Skipped by kernel (not beneficial):",
+            Lang::De => "Vom Kernel übersprungen (kein Gewinn):",
+        }
+    }
+
+    pub fn compact_result_space_skipped(self) -> &'static str {
+        match self {
+            Lang::En => "Skipped (low free disk space):",
+            Lang::De => "Übersprungen (zu wenig freier Platz):",
+        }
+    }
+
+    pub fn compact_result_actual_saved(self) -> &'static str {
+        match self {
+            Lang::En => "Net disk space saved:",
+            Lang::De => "Reale Netto-Ersparnis:",
+        }
+    }
+
+    pub fn compact_saved_val(self, before: impl Display, after: impl Display, saved: impl Display) -> String {
+        match self {
+            Lang::En => format!("{saved} ({before} → {after})"),
+            Lang::De => format!("{saved} ({before} → {after})"),
+        }
+    }
 }
 
 #[cfg(test)]

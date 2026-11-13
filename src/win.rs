@@ -1,6 +1,6 @@
 //! Windows implementation (re-exported from the crate root).
 
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -10,21 +10,24 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_FILE_SYSTEM_LIMITATION,
-    ERROR_HANDLE_EOF, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION,
-    ERROR_MORE_DATA, ERROR_NOT_SUPPORTED, ERROR_OBJECT_NOT_EXTERNALLY_BACKED,
-    ERROR_SHARING_VIOLATION, ERROR_USER_MAPPED_FILE, HANDLE, NO_ERROR, SetLastError,
+    GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_DISK_FULL,
+    ERROR_FILE_SYSTEM_LIMITATION, ERROR_HANDLE_EOF, ERROR_INVALID_FUNCTION,
+    ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_MORE_DATA, ERROR_NOT_SUPPORTED,
+    ERROR_OBJECT_NOT_EXTERNALLY_BACKED, ERROR_SHARING_VIOLATION, ERROR_USER_MAPPED_FILE, FILETIME,
+    HANDLE, NO_ERROR,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, COMPRESSION_FORMAT_NONE, FILE_ALLOCATION_INFO,
-    FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED,
+    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SPARSE_FILE,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
     FILE_PROVIDER_COMPRESSION_LZX, FILE_PROVIDER_COMPRESSION_XPRESS16K,
     FILE_PROVIDER_COMPRESSION_XPRESS4K, FILE_PROVIDER_COMPRESSION_XPRESS8K, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
-    FileAllocationInfo, GetCompressedFileSizeW, GetDiskFreeSpaceExW, GetFileAttributesW,
-    GetFileInformationByHandle, GetVolumeInformationW, GetVolumePathNameW,
-    INVALID_FILE_ATTRIBUTES, SetFileAttributesW, SetFileInformationByHandle, WOF_PROVIDER_FILE,
+    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    FILE_WRITE_DATA, FileAllocationInfo, GetCompressedFileSizeW, GetDiskFreeSpaceExW,
+    GetDiskFreeSpaceW, GetFileAttributesW, GetFileInformationByHandle, GetFileTime,
+    GetVolumeInformationW, GetVolumePathNameW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+    SetFileInformationByHandle, SetFileTime, WOF_PROVIDER_FILE,
 };
 use windows_sys::Win32::System::Ioctl::{
     FILE_PROVIDER_EXTERNAL_INFO_V1, FSCTL_DELETE_EXTERNAL_BACKING, FSCTL_GET_EXTERNAL_BACKING,
@@ -32,23 +35,78 @@ use windows_sys::Win32::System::Ioctl::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
-use crate::{display_path, is_virtual_disk, CompressionKind, WofAlgorithm};
+use crate::{display_path, is_virtual_disk, CompressionKind, WofAlgorithm, WofCompressOutcome};
 
 /// `FILE_FILE_COMPRESSION` from winnt.h (avoids the SystemServices feature).
 const FILE_FILE_COMPRESSION: u32 = 0x0000_0010;
+/// `FSCTL_SET_EXTERNAL_BACKING` (`CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 195, METHOD_BUFFERED, FILE_SPECIAL_ACCESS)`).
+const FSCTL_SET_EXTERNAL_BACKING: u32 = 0x0009_030C;
+/// Returned by `FSCTL_SET_EXTERNAL_BACKING` when compression would not save space.
+const ERROR_COMPRESSION_NOT_BENEFICIAL: u32 = 344;
+const WOF_CURRENT_VERSION: u32 = 1;
+const FILE_PROVIDER_CURRENT_VERSION: u32 = 1;
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryExW(lp_lib_file_name: *const u16, h_file: *mut c_void, dw_flags: u32)
+        -> *mut c_void;
+    fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const i8) -> *const c_void;
+    fn FreeLibrary(h_lib_module: *mut c_void) -> i32;
+}
+
+/// RAII wrapper for a system DLL loaded strictly from `%SystemRoot%\System32`.
+#[doc(hidden)]
+pub struct SystemDll(*mut c_void);
+
+impl SystemDll {
+    pub fn load(name: &str) -> Option<Self> {
+        let wide = to_wide(Path::new(name));
+        // SAFETY: `wide` is NUL-terminated; `LOAD_LIBRARY_SEARCH_SYSTEM32` prevents DLL hijacking.
+        let handle = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+        (!handle.is_null()).then_some(Self(handle))
+    }
+
+    pub fn proc(&self, name: &CStr) -> Option<*const c_void> {
+        // SAFETY: `self.0` is a valid loaded module handle and `name` is NUL-terminated.
+        let p = unsafe { GetProcAddress(self.0, name.as_ptr()) };
+        (!p.is_null()).then_some(p)
+    }
+}
+
+impl Drop for SystemDll {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was obtained from `LoadLibraryExW`.
+            unsafe {
+                let _ = FreeLibrary(self.0);
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 impl WofAlgorithm {
-    fn from_raw(raw: u32) -> Self {
+    pub(crate) fn from_raw(raw: u32) -> Self {
         match raw {
             FILE_PROVIDER_COMPRESSION_XPRESS4K => Self::Xpress4K,
             FILE_PROVIDER_COMPRESSION_XPRESS8K => Self::Xpress8K,
             FILE_PROVIDER_COMPRESSION_XPRESS16K => Self::Xpress16K,
             FILE_PROVIDER_COMPRESSION_LZX => Self::Lzx,
             other => Self::Unknown(other),
+        }
+    }
+
+    pub(crate) fn to_raw(self) -> Option<u32> {
+        match self {
+            Self::Xpress4K => Some(FILE_PROVIDER_COMPRESSION_XPRESS4K),
+            Self::Lzx => Some(FILE_PROVIDER_COMPRESSION_LZX),
+            Self::Xpress8K => Some(FILE_PROVIDER_COMPRESSION_XPRESS8K),
+            Self::Xpress16K => Some(FILE_PROVIDER_COMPRESSION_XPRESS16K),
+            Self::Unknown(_) => None,
         }
     }
 }
@@ -64,6 +122,10 @@ pub struct VolumeInfo {
     pub supports_compression: bool,
     /// Free space available to the current user, in bytes.
     pub free_bytes: u64,
+    /// Total capacity available to the current user, in bytes.
+    pub total_bytes: u64,
+    /// Cluster size in bytes (non-admin via `GetDiskFreeSpaceW`, fallback `4096`).
+    pub bytes_per_cluster: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -339,18 +401,49 @@ pub fn volume_info(path: &Path) -> io::Result<VolumeInfo> {
     }
     let fs_len = fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len());
 
-    let mut free = 0u64;
-    // SAFETY: root is NUL-terminated.
-    if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free, null_mut(), null_mut()) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let (free, total) = free_and_total_wide(&root)?;
+
+    let mut spc = 0u32;
+    let mut bps = 0u32;
+    let mut unused1 = 0u32;
+    let mut unused2 = 0u32;
+    // SAFETY: `root` is NUL-terminated; pointers refer to stack locals.
+    let cluster_ok = unsafe {
+        GetDiskFreeSpaceW(root.as_ptr(), &mut spc, &mut bps, &mut unused1, &mut unused2)
+    };
+    let bytes_per_cluster = if cluster_ok != 0 {
+        spc.saturating_mul(bps).max(512)
+    } else {
+        4096
+    };
 
     Ok(VolumeInfo {
         root: PathBuf::from(std::ffi::OsString::from_wide(&root[..root_len])),
         fs_name: String::from_utf16_lossy(&fs_name[..fs_len]),
         supports_compression: fs_flags & FILE_FILE_COMPRESSION != 0,
         free_bytes: free,
+        total_bytes: total,
+        bytes_per_cluster,
     })
+}
+
+fn free_and_total_wide(root_wide: &[u16]) -> io::Result<(u64, u64)> {
+    let mut free = 0u64;
+    let mut total = 0u64;
+    // SAFETY: `root_wide` is NUL-terminated; pointers refer to stack locals.
+    if unsafe { GetDiskFreeSpaceExW(root_wide.as_ptr(), &mut free, &mut total, null_mut()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((free, total))
+}
+
+/// Returns `(free_bytes_available_to_caller, total_bytes)` for a volume root.
+pub fn volume_free_and_total(root: &Path) -> io::Result<(u64, u64)> {
+    let mut wide = to_wide(root);
+    if wide.len() >= 2 && wide[wide.len() - 2] != u16::from(b'\\') {
+        wide.insert(wide.len() - 1, u16::from(b'\\'));
+    }
+    free_and_total_wide(&wide)
 }
 
 /// Raw file attributes (`GetFileAttributesW`).
@@ -516,6 +609,96 @@ pub fn remove_compression(path: &Path, kind: CompressionKind) -> io::Result<()> 
     match kind {
         CompressionKind::Lznt1 => remove_ntfs_compression(path, false),
         CompressionKind::Wof(_) => remove_wof_compression(path),
+    }
+}
+
+/// Attributes incompatible with `FSCTL_SET_EXTERNAL_BACKING`.
+const WOF_BLOCKED_ATTRS: u32 = FILE_ATTRIBUTE_SPARSE_FILE
+    | FILE_ATTRIBUTE_REPARSE_POINT
+    | FILE_ATTRIBUTE_DIRECTORY
+    | FILE_ATTRIBUTE_ENCRYPTED
+    | FILE_ATTRIBUTE_COMPRESSED;
+
+/// Compresses a single file using Windows Overlay Filter (`FSCTL_SET_EXTERNAL_BACKING`).
+///
+/// Rejects directories, sparse files, reparse points, EFS-encrypted files, and files still
+/// carrying `FILE_ATTRIBUTE_COMPRESSED` (`LZNT1`) with `ErrorKind::InvalidInput`.
+/// Temporarily clears `FILE_ATTRIBUTE_READONLY` via [`ReadonlyGuard`] and preserves timestamps.
+pub fn compress_wof(path: &Path, algorithm: WofAlgorithm) -> io::Result<WofCompressOutcome> {
+    let raw_alg = algorithm.to_raw().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "unsupported WOF algorithm")
+    })?;
+    if file_attributes(path)? & WOF_BLOCKED_ATTRS != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot WOF-compress directory, sparse, reparse-point, encrypted, or LZNT1-compressed item",
+        ));
+    }
+
+    let _ro = ReadonlyGuard::clear(path)?;
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(path)?;
+
+    if file_attributes_of(&file)? & WOF_BLOCKED_ATTRS != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot WOF-compress directory, sparse, reparse-point, encrypted, or LZNT1-compressed item",
+        ));
+    }
+
+    let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut accessed = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut written = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    // SAFETY: `file` is open with `FILE_READ_ATTRIBUTES`; pointers point to stack `FILETIME` structs.
+    let have_times =
+        unsafe { GetFileTime(raw_handle(&file), &mut created, &mut accessed, &mut written) } != 0;
+
+    #[repr(C)]
+    struct SetBackingInput {
+        wof: WOF_EXTERNAL_INFO,
+        file: FILE_PROVIDER_EXTERNAL_INFO_V1,
+    }
+    const _: () = assert!(std::mem::size_of::<SetBackingInput>() == 20);
+
+    let input = SetBackingInput {
+        wof: WOF_EXTERNAL_INFO {
+            Version: WOF_CURRENT_VERSION,
+            Provider: WOF_PROVIDER_FILE,
+        },
+        file: FILE_PROVIDER_EXTERNAL_INFO_V1 {
+            Version: FILE_PROVIDER_CURRENT_VERSION,
+            Algorithm: raw_alg,
+            Flags: 0,
+        },
+    };
+    // SAFETY: `input` is a packed 20-byte POD buffer matching `FSCTL_SET_EXTERNAL_BACKING`.
+    let res = unsafe {
+        ioctl(
+            &file,
+            FSCTL_SET_EXTERNAL_BACKING,
+            (&input as *const SetBackingInput).cast(),
+            std::mem::size_of::<SetBackingInput>() as u32,
+            null_mut(),
+            0,
+        )
+    };
+
+    if have_times {
+        // SAFETY: `file` is open with `FILE_WRITE_ATTRIBUTES`; restore original timestamps.
+        unsafe {
+            let _ = SetFileTime(raw_handle(&file), &created, &accessed, &written);
+        }
+    }
+
+    match res {
+        Ok(_) => Ok(WofCompressOutcome::Compressed),
+        Err(e) if os_code(&e) == Some(ERROR_COMPRESSION_NOT_BENEFICIAL) => {
+            Ok(WofCompressOutcome::NotBeneficial)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1049,5 +1232,117 @@ mod tests {
         drop(f);
         assert!(!is_compressed(&path));
         assert_eq!(fs::metadata(&path).unwrap().len(), 128 * 1024);
+    }
+
+    #[test]
+    fn compress_wof_xpress4k_preserves_timestamps_and_readonly() {
+        let dir = TempDir::new("wof-ok");
+        let Ok(vi) = volume_info(&dir.0) else { return };
+        if !vi.fs_name.eq_ignore_ascii_case("NTFS") {
+            return;
+        }
+        assert!(vi.total_bytes > 0);
+        assert!(vi.bytes_per_cluster >= 512);
+
+        let path = dir.0.join("redundant.bin");
+        let payload: Vec<u8> = b"ntfs-unthrottle-wof-test-pattern!"
+            .iter()
+            .copied()
+            .cycle()
+            .take(256 * 1024)
+            .collect();
+        fs::write(&path, &payload).unwrap();
+
+        // Set deterministic past timestamps and ReadOnly attribute.
+        let ft = FILETIME { dwLowDateTime: 0x1234_5678, dwHighDateTime: 0x01D9_0000 };
+        {
+            let f = OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .open(&path)
+                .unwrap();
+            assert_ne!(unsafe { SetFileTime(raw_handle(&f), &ft, &ft, &ft) }, 0);
+        }
+        let wide = to_wide(&path);
+        let attrs = file_attributes(&path).unwrap();
+        assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), attrs | FILE_ATTRIBUTE_READONLY) }, 0);
+
+        let outcome = compress_wof(&path, WofAlgorithm::Xpress4K).unwrap();
+        assert_eq!(outcome, WofCompressOutcome::Compressed);
+        assert_eq!(compression_kind(&path).unwrap(), Some(CompressionKind::Wof(WofAlgorithm::Xpress4K)));
+        assert!(physical_size(&path).unwrap() < payload.len() as u64);
+        assert_ne!(file_attributes(&path).unwrap() & FILE_ATTRIBUTE_READONLY, 0);
+
+        let f = open_for_query(&path).unwrap();
+        let mut c = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut a = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut w = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        assert_ne!(unsafe { GetFileTime(raw_handle(&f), &mut c, &mut a, &mut w) }, 0);
+        assert_eq!((c.dwLowDateTime, c.dwHighDateTime), (ft.dwLowDateTime, ft.dwHighDateTime));
+        assert_eq!((w.dwLowDateTime, w.dwHighDateTime), (ft.dwLowDateTime, ft.dwHighDateTime));
+        drop(f);
+
+        remove_wof_compression(&path).unwrap();
+        assert_eq!(compression_kind(&path).unwrap(), None);
+        // ReadonlyGuard should preserve ReadOnly across remove_wof_compression too, clear for TempDir drop.
+        let _ = unsafe { SetFileAttributesW(wide.as_ptr(), attrs & !FILE_ATTRIBUTE_READONLY) };
+    }
+
+    #[test]
+    fn compress_wof_incompressible_returns_not_beneficial() {
+        let dir = TempDir::new("wof-rnd");
+        let Ok(vi) = volume_info(&dir.0) else { return };
+        if !vi.fs_name.eq_ignore_ascii_case("NTFS") {
+            return;
+        }
+        let path = dir.0.join("random.bin");
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut buf = vec![0u8; 256 * 1024];
+        for chunk in buf.chunks_exact_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes());
+        }
+        fs::write(&path, &buf).unwrap();
+
+        let outcome = compress_wof(&path, WofAlgorithm::Xpress4K).unwrap();
+        assert_eq!(outcome, WofCompressOutcome::NotBeneficial);
+        assert_eq!(compression_kind(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn compress_wof_rejects_sparse_lznt1_and_unknown() {
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+        let dir = TempDir::new("wof-rej");
+        let Ok(vi) = volume_info(&dir.0) else { return };
+        if !vi.fs_name.eq_ignore_ascii_case("NTFS") {
+            return;
+        }
+        let sparse_path = dir.0.join("sparse.bin");
+        {
+            let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&sparse_path).unwrap();
+            let _ = unsafe { ioctl(&f, FSCTL_SET_SPARSE, null(), 0, null_mut(), 0) };
+        }
+        if file_attributes(&sparse_path).unwrap() & FILE_ATTRIBUTE_SPARSE_FILE != 0 {
+            let err = compress_wof(&sparse_path, WofAlgorithm::Xpress4K).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        let plain = dir.0.join("plain.bin");
+        fs::write(&plain, b"abc").unwrap();
+        assert_eq!(
+            compress_wof(&plain, WofAlgorithm::Unknown(99)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        if let Some(cdir) = compressed_temp_dir("wof-lznt1") {
+            let lznt1 = cdir.0.join("lznt1.bin");
+            fs::write(&lznt1, vec![0u8; 64 * 1024]).unwrap();
+            assert_eq!(
+                compress_wof(&lznt1, WofAlgorithm::Xpress4K).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 }

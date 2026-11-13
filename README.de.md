@@ -18,11 +18,12 @@
    - [Archive, Disk-Images und große Container](#2-archive-disk-images-und-große-container)
    - [Entwickler (Rust, Node, Docker, WSL2)](#3-entwickler-rust-node-docker-wsl2)
    - [System-Pflege mit CompactGUI und CompactOS](#4-system-pflege-mit-compactgui-und-compactos)
-7. [Volume-Diagnose und Tuning](#volume-diagnose-und-tuning)
-8. [Befehlsreferenz](#befehlsreferenz)
-9. [Schutzmechanismen (Poka-Yoke)](#schutzmechanismen-poka-yoke)
-10. [Als Rust-Bibliothek verwenden](#als-rust-bibliothek-verwenden)
-11. [Technischer Hintergrund](#technischer-hintergrund)
+7. [Selektive WOF-Komprimierung (`compact`)](#selektive-wof-komprimierung-compact)
+8. [Volume-Diagnose und Tuning](#volume-diagnose-und-tuning)
+9. [Befehlsreferenz](#befehlsreferenz)
+10. [Schutzmechanismen (Poka-Yoke)](#schutzmechanismen-poka-yoke)
+11. [Als Rust-Bibliothek verwenden](#als-rust-bibliothek-verwenden)
+12. [Technischer Hintergrund](#technischer-hintergrund)
 
 ---
 
@@ -231,6 +232,48 @@ ntfs-unthrottle "C:\Program Files\MeinProgramm" --all --min-size 0 --fix
 
 ---
 
+## Selektive WOF-Komprimierung (`compact`)
+
+Während der Standard-Scan kontraproduktive Komprimierung *entfernt*, komprimiert
+`ntfs-unthrottle compact` gezielt statische, gut komprimierbare Dateien (Spiele-Assets, Toolchains,
+Dokumentation, unkomprimierte Text-/Datenbestände) direkt über `FSCTL_SET_EXTERNAL_BACKING` (`WOF`):
+
+- **Schreibfreie Vorab-Analyse (PE + `XPRESS_HUFF`):** Prüft bis zu `16 KiB` auf PE-Header-Merkmale
+  (PE32 / PE32+ / `.NET` / Packer-Sections / große Asset-Overlays) und testet `8 × 16 KiB`
+  Stichproben rein im Arbeitsspeicher über Windows' eigene `cabinet.dll` (`COMPRESS_ALGORITHM_XPRESS_HUFF`)
+  – ohne Schreiblast auf der SSD und ohne `LastAccessTime`-Veränderung.
+- **Reale Cluster- & WOF-Header-Mathematik:** Rechnet den Offset-Tabellen-Overhead von
+  `::WofCompressedData` (`(Chunks + 1) × 4/8 B`), Cluster-Rundung, Kleindatei-/MFT-Grenzen sowie einen
+  Cluster-Regressionsschutz bei `LZNT1 -> WOF` mit ein. `ERROR_COMPRESSION_NOT_BENEFICIAL` (`344`)
+  wird sauber als „nicht lohnend“ behandelt.
+- **Hardware- & Workload-Profile (`--profile`):**
+  - `auto` *(Standard)*: nutzt `speed`; schaltet je Volume automatisch auf `balanced`, wenn eine bekannte QLC-SSD `< 20 %` freien Speicher hat.
+  - `speed`: überspringt ausführbare Dateien und mittlere Einsparungen auf NVMe; deckelt hohe Redundanz auf NVMe bei max. `Xpress16K` (verhindert, dass LZX mit `~120–180 MiB/s` eine NVMe auf HDD-Lesetempo drosselt).
+  - `balanced`: nutzt `Xpress8K`/`Lzx` für Daten auf NVMe, lässt Programmcode dort aber unberührt; auf SATA/HDD/USB volle Kompression.
+  - `space`: komprimiert auf allen Laufwerken maximal (`Xpress4K` auf Executables, `Lzx` auf hochredundanten Daten).
+- **Harte Ausschlüsse:** Niemals komprimiert werden `.sys`/`.efi`-Treiber, EFS-verschlüsselte oder
+  Sparse-Dateien, Cloud-Platzhalter, Reparse-Points, geschützte OS-Pfade, `WRITE_HEAVY_EXTS`,
+  Build-Verzeichnisse, Shader-Caches sowie **DirectStorage-Spiele auf NVMe** (bereits vor den
+  Probe-Reads verworfen). Hardlinks werden standardmäßig übersprungen (`--include-hardlinks`
+  komprimiert sie dedupliziert pro `FileId`).
+- **Sichere Ausführung (`--fix`):** Standardmäßig schreibgeschützter Dry-Run (Exit-Code `2` bei
+  Treffern). Mit `--fix` wird pro Volume aufsteigend nach Dateigröße sortiert, vor jeder einzelnen
+  Datei `free >= logical + max(256 MiB, 1%)` geprüft, bestehende `LZNT1`-/`WOF`-Komprimierung sauber
+  entfernt und Zeitstempel sowie `ReadOnly`-Attribute vollständig erhalten.
+
+```powershell
+# Dry-Run: Kandidaten mit hardware-bewusstem Auto-Profil prüfen:
+ntfs-unthrottle compact "D:\Games"
+
+# Im Balanced-Profil skripttauglich anwenden:
+ntfs-unthrottle compact "D:\Archive" --profile balanced --fix --yes --json
+
+# Bereits WOF-komprimierte Dateien auf lohnende stärkere Algorithmen prüfen:
+ntfs-unthrottle compact "E:\Assets" --profile space --recompress --fix
+```
+
+---
+
 ## Volume-Diagnose und Tuning
 
 `--optimize` scannt keine Einzeldateien, sondern prüft für die Volumes der angegebenen
@@ -292,6 +335,23 @@ ntfs-unthrottle E:\ --optimize --fix    # anwenden (Terminal als Administrator)
 
 **Exit-Codes:** `0` nichts zu tun / alles behoben · `1` Fehler · `2` Dry-Run hat
 Kandidaten gefunden · `3` einzelne Elemente schlugen fehl · `130` durch Benutzer abgebrochen (`Strg+C`).
+
+### Unterbefehl `ntfs-unthrottle compact`
+
+| Option | Standard | Bedeutung |
+|---|---|---|
+| `<PFADE>...` | `.` | Ordner oder Dateien für die selektive WOF-Komprimierung |
+| `-f, --fix` | *aus* | WOF-Komprimierung tatsächlich anwenden (ohne: reiner Dry-Run) |
+| `-y, --yes` | *aus* | Sicherheitsabfrage überspringen (erfordert `--fix`; Pflicht mit `--fix --json`) |
+| `--profile <auto\|speed\|balanced\|space>` | `auto` | Aggressivität und NVMe-/QLC-Schutzprofil |
+| `--min-savings <PROZENT>` | `15` | Geschätzte physische Mindest-Ersparnis in Prozent |
+| `--min-size <KiB>` | `32` | Mindestgröße einer Datei in KiB |
+| `--recompress` | *aus* | Bereits WOF-komprimierte Dateien erneut prüfen, wenn ein Wechsel `>= max(min-savings, 10) %` und `>= 2` Cluster extra spart |
+| `--include-hardlinks` | *aus* | Hardlinks einmal pro `FileId` komprimieren statt `links > 1` zu überspringen |
+
+Die globalen Optionen `-v, --verbose`, `--json`, `-x, --exclude` und `--lang` gelten auch für
+`compact` (z. B. `ntfs-unthrottle compact E:\ --json`). Mischformen mit Top-Level-Scan-Flags wie
+`--optimize` oder `--recommended` werden von `clap` abgewiesen.
 
 **Ausgabesprache:** Mit `--lang auto` gilt zuerst `LC_ALL`, `LC_MESSAGES` bzw. `LANG`
 (ignoriert, wenn leer oder `C`/`POSIX`), sonst die Windows-Anzeigesprache. Deutsches
@@ -381,6 +441,10 @@ fn main() -> std::io::Result<()> {
 - Für bereits offene Dateien meldet `disable_compression(&file)` Fehler – das Handle braucht
   dafür Lese- **und** Schreibzugriff (`File::create` allein reicht nicht). Auf FAT/exFAT/ReFS
   ist es ein No-op.
+- `compress_wof(path, algorithm)` / `WofCompressOutcome` – wendet WOF-Komprimierung
+  (`Xpress4K`, `Lzx`, `Xpress8K`, `Xpress16K`) via `FSCTL_SET_EXTERNAL_BACKING` an, erhält
+  Zeitstempel sowie `ReadOnly`-Attribute, lehnt `SPARSE`, `REPARSE`, `DIRECTORY`, `ENCRYPTED` und
+  `COMPRESSED` ab und liefert bei `ERROR_COMPRESSION_NOT_BENEFICIAL` sauber `Ok(WofCompressOutcome::NotBeneficial)`.
 
 Auf anderen Plattformen als Windows kompilieren die obigen Funktionen als günstige No-ops
 (`File::create`, `std::fs::create_dir_all`, `Ok(None)` …) – Aufrufer brauchen keine eigenen
@@ -403,11 +467,12 @@ Auf anderen Plattformen als Windows kompilieren die obigen Funktionen als günst
 - **Vererbung** gilt nur vom *direkten* Elternordner zum Zeitpunkt des Anlegens.
   Bestehende Dateien ändern sich nicht, wenn man das Ordnerflag entfernt – daher
   bereinigt `ntfs-unthrottle` beides.
-- **WOF** speichert Daten komprimiert im Stream `::WofCompressedData`, ohne das Attribut
-  `COMPRESSED` zu setzen. Schreibt ein Programm in eine WOF-Datei, entpackt Windows sie
-  automatisch. `compact /exe` überspringt unkomprimierbare Dateien selbst – WOF ist für
-  Hoch-Entropie-Daten also selten das Problem, für Build-Ordner und DirectStorage-Spiele
-  auf NVMe jedoch durchaus.
+- **WOF** speichert Daten komprimiert im Stream `::WofCompressedData` (mit vorangestellter
+  Chunk-Offset-Tabelle à `(Chunks + 1) × 4/8 B`), ohne das Attribut `COMPRESSED` zu setzen. Schreibt
+  ein Programm in eine WOF-Datei, entpackt Windows sie automatisch. Für Build-Ordner und
+  DirectStorage-Spiele auf NVMe ist WOF daher schädlich; für statische, gut komprimierbare Daten
+  ermöglicht `FSCTL_SET_EXTERNAL_BACKING` hingegen selektives Platzsparen ohne `compact.exe` und
+  ohne Veränderung der `LastAccessTime` im Dry-Run.
 - `FSCTL_SET_COMPRESSION` mit `COMPRESSION_FORMAT_NONE` blockiert, bis die Datei
   vollständig unkomprimiert neu geschrieben ist. Es braucht dafür nur die Differenz
   `logisch − physisch` an freiem Platz. Auf SSDs steigt der Lesedurchsatz sofort wieder

@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod compact;
 mod i18n;
 mod optimize;
+mod probe;
 
 use clap::Parser;
 use console::style;
@@ -41,11 +43,11 @@ use windows_sys::Win32::System::Console::{
 };
 
 /// Placeholders of OneDrive & co. – opening them with write access would download them.
-const CLOUD_ATTRS: u32 =
+pub(crate) const CLOUD_ATTRS: u32 =
     FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN;
 
 /// Known high-entropy formats (already compressed or encrypted).
-const HIGH_ENTROPY_EXTS: &[&str] = &[
+pub(crate) const HIGH_ENTROPY_EXTS: &[&str] = &[
     // Compressed / encrypted binary containers
     "xci", "xcz", "nsp", "nsz", "nca", "ncz",
     // Archives
@@ -60,7 +62,7 @@ const HIGH_ENTROPY_EXTS: &[&str] = &[
 
 /// --recommended: formats with many (random) writes. Compression fragments
 /// them heavily (up to ERROR_FILE_SYSTEM_LIMITATION) – always decompress.
-const WRITE_HEAVY_EXTS: &[&str] = &[
+pub(crate) const WRITE_HEAVY_EXTS: &[&str] = &[
     // VM images & snapshots
     "vhd", "vhdx", "avhdx", "vmdk", "vdi", "qcow2", "vmem", "vmsn", "vmss", "nvram",
     // Databases
@@ -94,7 +96,7 @@ const GENERIC_BUILD_DIRS: &[(&str, &[&str])] = &[
     ("obj", &["*.csproj", "*.vcxproj", "*.fsproj", "*.vbproj", "*.sln"]),
 ];
 
-fn has_ext(path: &Path, list: &[&str]) -> bool {
+pub(crate) fn has_ext(path: &Path, list: &[&str]) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| list.contains(&e.to_ascii_lowercase().as_str()))
@@ -145,13 +147,13 @@ fn dir_in_build_tree(start_dir: &Path, root: &Path, cache: &mut HashMap<PathBuf,
 /// and folders below it are checked – not what lies above
 /// (`E:\target\Games` as scan path does not turn everything into a build folder).
 /// `cache` remembers the marker result per generic folder.
-fn in_build_dir(path: &Path, root: &Path, cache: &mut HashMap<PathBuf, bool>) -> bool {
+pub(crate) fn in_build_dir(path: &Path, root: &Path, cache: &mut HashMap<PathBuf, bool>) -> bool {
     path.parent().is_some_and(|d| dir_in_build_tree(d, root, cache))
 }
 
-const EXIT_FOUND: u8 = 2;
-const EXIT_PARTIAL: u8 = 3;
-const EXIT_INTERRUPTED: u8 = 130;
+pub(crate) const EXIT_FOUND: u8 = 2;
+pub(crate) const EXIT_PARTIAL: u8 = 3;
+pub(crate) const EXIT_INTERRUPTED: u8 = 130;
 
 /// Minimum decompressed size of a WOF file before post-fix fragmentation is checked.
 const WOF_POST_FRAG_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -172,17 +174,27 @@ enum OnlyReason {
     All,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Compress eligible static files using transparent WOF (Windows Overlay Filter)
+    Compact(compact::CompactArgs),
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "ntfs-unthrottle",
     version,
     about = "Removes invisible I/O bottlenecks caused by transparent NTFS/WOF compression.",
     after_help = "Exit codes: 0 = nothing to do/all fixed, 1 = error, \
-                  2 = dry-run found candidates, 3 = some items failed, 130 = interrupted (Ctrl+C)."
+                  2 = dry-run found candidates, 3 = some items failed, 130 = interrupted (Ctrl+C).",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Folders or files to check
-    #[arg(default_value = ".")]
+    #[arg(value_parser = parse_scan_path)]
     paths: Vec<PathBuf>,
 
     /// Actually apply changes (without: analysis only)
@@ -233,12 +245,12 @@ struct Cli {
     no_fragments: bool,
 
     /// List all candidates and folders instead of only the largest
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     verbose: bool,
 
     /// Emit machine-readable JSON on stdout (progress/warnings go to stderr or are suppressed;
     /// combining with --fix requires --yes)
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
 
     /// Optimizer: check storage device, MFT, 8.3 names, last access and TRIM of the volumes
@@ -248,12 +260,12 @@ struct Cli {
 
     /// Exclude: name (e.g. node_modules – matches at any depth) or path (e.g. E:\Backup).
     /// Repeatable. System folders are always protected.
-    #[arg(short = 'x', long = "exclude", value_name = "NAME|PATH")]
+    #[arg(short = 'x', long = "exclude", value_name = "NAME|PATH", global = true)]
     exclude: Vec<String>,
 
     /// Output language of runtime messages (auto = LC_ALL/LC_MESSAGES/LANG,
     /// then the Windows UI language). --help is always English.
-    #[arg(long, value_enum, value_name = "LANG", default_value_t = LangChoice::Auto)]
+    #[arg(long, value_enum, value_name = "LANG", default_value_t = LangChoice::Auto, global = true)]
     lang: LangChoice,
 }
 
@@ -297,7 +309,7 @@ pub(crate) fn put_path(obj: &mut Map<String, Value>, key: &str, path: &Path) {
     }
 }
 
-fn path_obj(path: &Path) -> Value {
+pub(crate) fn path_obj(path: &Path) -> Value {
     let mut m = Map::new();
     put_path(&mut m, "path", path);
     Value::Object(m)
@@ -383,22 +395,26 @@ fn protected_path(path: &Path) -> Option<(PathBuf, Protected)> {
     })
 }
 
-struct Excludes {
+pub(crate) struct Excludes {
     names: Vec<String>,
     paths: Vec<String>,
 }
 
 impl Excludes {
     fn new(cli: &Cli) -> io::Result<Self> {
+        Self::from_list(&cli.exclude, cli.json)
+    }
+
+    pub(crate) fn from_list(exclude: &[String], json: bool) -> io::Result<Self> {
         let mut names = Vec::new();
         let mut paths = Vec::new();
-        for x in &cli.exclude {
+        for x in exclude {
             if x.contains(['\\', '/', ':']) {
                 let c = match std::fs::canonicalize(x) {
                     Ok(c) => c,
                     // What does not exist cannot be scanned either – no reason to abort.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        if !cli.json {
+                        if !json {
                             eprintln!("{} {}", style("ℹ").blue().bold(), tr().exclude_missing(x));
                         }
                         continue;
@@ -413,7 +429,7 @@ impl Excludes {
         Ok(Self { names, paths })
     }
 
-    fn matches(&self, path: &Path, attrs: Option<u32>) -> bool {
+    pub(crate) fn matches(&self, path: &Path, attrs: Option<u32>) -> bool {
         if protected_reason(path, attrs).is_some() {
             return true;
         }
@@ -432,7 +448,18 @@ impl Excludes {
     }
 }
 
-fn parse_percent(s: &str) -> Result<f64, String> {
+fn parse_scan_path(s: &str) -> Result<PathBuf, String> {
+    if s.eq_ignore_ascii_case("compact") {
+        return Err(
+            "cannot combine top-level flags/paths with the 'compact' subcommand \
+             (pass '.\\compact' if targeting a directory named 'compact')"
+                .into(),
+        );
+    }
+    Ok(PathBuf::from(s))
+}
+
+pub(crate) fn parse_percent(s: &str) -> Result<f64, String> {
     let v: f64 = s.trim_end_matches('%').parse().map_err(|_| format!("not a number: {s}"))?;
     if (0.0..=100.0).contains(&v) {
         Ok(v)
@@ -508,13 +535,13 @@ struct Scan {
 
 /// Volume and storage device of a scan root – determined once.
 #[derive(Default)]
-struct RootInfo {
-    vol: Option<VolumeInfo>,
-    dev: Option<DeviceInfo>,
+pub(crate) struct RootInfo {
+    pub(crate) vol: Option<VolumeInfo>,
+    pub(crate) dev: Option<DeviceInfo>,
 }
 
 impl RootInfo {
-    fn new(root: &Path) -> Self {
+    pub(crate) fn new(root: &Path) -> Self {
         // device_info needs the volume root or mount point –
         // on a subfolder (E:\Games) it would silently fail.
         let vol = volume_info(root).ok();
@@ -522,8 +549,12 @@ impl RootInfo {
         Self { vol, dev }
     }
 
-    fn vol_root(&self) -> Option<&Path> {
+    pub(crate) fn vol_root(&self) -> Option<&Path> {
         self.vol.as_ref().map(|v| v.root.as_path())
+    }
+
+    pub(crate) fn cluster_size(&self) -> u64 {
+        self.vol.as_ref().map_or(4096, |v| u64::from(v.bytes_per_cluster.max(512)))
     }
 
     /// WOF (`wof.sys`) only exists on NTFS – independent of `supports_compression`
@@ -534,7 +565,7 @@ impl RootInfo {
     }
 
     /// Only real NVMe – RAID, Storage Spaces, USB enclosures do not count (no BypassIO).
-    fn is_nvme(&self) -> bool {
+    pub(crate) fn is_nvme(&self) -> bool {
         self.dev.as_ref().is_some_and(|d| d.bus == Some("NVMe"))
     }
 }
@@ -542,7 +573,7 @@ impl RootInfo {
 // --- Path comparisons (NTFS is case-insensitive) ----------------------------
 
 /// Normalized component name (Unicode lowercase, so `Übung` = `übung` as well).
-fn fold(s: &std::ffi::OsStr) -> String {
+pub(crate) fn fold(s: &std::ffi::OsStr) -> String {
     s.to_string_lossy().to_lowercase()
 }
 
@@ -567,7 +598,7 @@ fn norm(p: &Path) -> Vec<String> {
 
 /// Is `path` inside `base` (or `base` itself)? Compared per component,
 /// so `GameAB` is not inside `GameA`.
-fn under(path: &Path, base: &Path) -> bool {
+pub(crate) fn under(path: &Path, base: &Path) -> bool {
     let (p, b) = (norm(path), norm(base));
     p.len() >= b.len() && p[..b.len()] == b[..]
 }
@@ -577,13 +608,13 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// Compares a component name with an already lowercased name.
-fn comp_eq(a: &std::ffi::OsStr, lower: &str) -> bool {
+pub(crate) fn comp_eq(a: &std::ffi::OsStr, lower: &str) -> bool {
     fold(a) == lower
 }
 
 /// Removes paths contained in another (or the same) path.
 /// Returns the kept and the dropped paths (together with the containing path).
-fn dedup_roots(mut roots: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
+pub(crate) fn dedup_roots(mut roots: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
     roots.sort_by_key(|p| p.components().count());
     let mut kept: Vec<PathBuf> = Vec::new();
     let mut dropped = Vec::new();
@@ -599,7 +630,7 @@ fn dedup_roots(mut roots: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)
 // --- DirectStorage detection -----------------------------------------------
 
 /// Games have to ship DirectStorage themselves – the names are fixed.
-const DS_DLLS: &[&str] = &["dstorage.dll", "dstoragecore.dll"];
+pub(crate) const DS_DLLS: &[&str] = &["dstorage.dll", "dstoragecore.dll"];
 
 /// Folders of game libraries (lowercase); the folder after them is the game.
 const LIBRARY_MARKERS: &[&[&str]] = &[
@@ -658,7 +689,7 @@ fn ends_with_names(p: &Path, names: &[&str]) -> bool {
 
 /// Derives the game folder from the folder of a DirectStorage DLL – pure
 /// path logic. `None` if the DLL lies directly in a volume root.
-fn ds_game_root(dll_dir: &Path, vol_root: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn ds_game_root(dll_dir: &Path, vol_root: Option<&Path>) -> Option<PathBuf> {
     if is_vol_root(dll_dir, vol_root) {
         return None;
     }
@@ -867,7 +898,7 @@ fn apply_only_filters(cli: &Cli, scan: &mut Scan, roots: &[PathBuf], notes: &Sto
     }
 }
 
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static CTRL_C_COUNT: AtomicU8 = AtomicU8::new(0);
 
 unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
@@ -886,12 +917,12 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
     }
 }
 
-struct CtrlHandlerGuard {
+pub(crate) struct CtrlHandlerGuard {
     installed: bool,
 }
 
 impl CtrlHandlerGuard {
-    fn install() -> Self {
+    pub(crate) fn install() -> Self {
         INTERRUPTED.store(false, Ordering::SeqCst);
         CTRL_C_COUNT.store(0, Ordering::SeqCst);
         // Safety: `console_ctrl_handler` matches Win32 `PHANDLER_ROUTINE`.
@@ -914,7 +945,7 @@ impl Drop for CtrlHandlerGuard {
 const SMALL_FILE_THRESHOLD: u64 = 1024 * 1024;
 const EMA_TAU_SECS: f64 = 5.0;
 
-struct EtaTracker {
+pub(crate) struct EtaTracker {
     total_files: usize,
     done_files: usize,
     total_bytes: u64,
@@ -949,13 +980,25 @@ impl EtaTracker {
         }
     }
 
-    fn from_candidates(files: &[Candidate], now: Instant) -> Self {
-        let total_bytes = files.iter().map(|f| f.logical).sum();
-        let small_files = files.iter().filter(|f| f.logical < SMALL_FILE_THRESHOLD).count();
-        Self::with_totals(files.len(), total_bytes, small_files, now)
+    pub(crate) fn from_sizes(sizes: impl Iterator<Item = u64>, now: Instant) -> Self {
+        let mut count = 0usize;
+        let mut total_bytes = 0u64;
+        let mut small_files = 0usize;
+        for sz in sizes {
+            count += 1;
+            total_bytes = total_bytes.saturating_add(sz);
+            if sz < SMALL_FILE_THRESHOLD {
+                small_files += 1;
+            }
+        }
+        Self::with_totals(count, total_bytes, small_files, now)
     }
 
-    fn record(&mut self, bytes: u64, now: Instant) {
+    fn from_candidates(files: &[Candidate], now: Instant) -> Self {
+        Self::from_sizes(files.iter().map(|f| f.logical), now)
+    }
+
+    pub(crate) fn record(&mut self, bytes: u64, now: Instant) {
         self.done_files += 1;
         self.done_bytes = self.done_bytes.saturating_add(bytes);
         self.win_files += 1;
@@ -1064,7 +1107,11 @@ fn main() -> ExitCode {
         }
     };
     i18n::init(i18n::detect(cli.lang));
-    if cli.json && cli.fix && !cli.yes {
+    let needs_yes = match &cli.command {
+        Some(Command::Compact(c)) => c.fix && !c.yes,
+        None => cli.fix && !cli.yes,
+    };
+    if cli.json && needs_yes {
         emit_json_error(tr().json_fix_requires_yes());
         return ExitCode::from(2);
     }
@@ -1081,15 +1128,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> io::Result<ExitCode> {
-    if cli.optimize {
-        return optimize::run(&cli.paths, cli.fix, cli.yes, cli.json);
-    }
+pub(crate) fn resolve_scan_roots(paths: &[PathBuf], json: bool) -> io::Result<(Vec<PathBuf>, Vec<RootInfo>)> {
     let l = tr();
     // Canonical \\?\ paths: this way paths > 260 characters also work with
     // the raw Win32 calls.
     let mut roots = Vec::new();
-    for p in &cli.paths {
+    for p in paths {
         // Poka-yoke: reject directly given system paths (or paths inside them) –
         // first purely by name, because canonicalize already fails on locked
         // system paths (System Volume Information, pagefile.sys).
@@ -1097,7 +1141,7 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
         let canon = std::fs::canonicalize(p);
         let check = canon.as_deref().unwrap_or(&abs);
         if let Some((hit, why)) = protected_path(&abs).or_else(|| protected_path(check)) {
-            if !cli.json {
+            if !json {
                 eprintln!(
                     "{} {}",
                     style("⛔").red().bold(),
@@ -1114,7 +1158,7 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     // Scan overlapping paths only once – otherwise duplicate candidates,
     // duplicate space requirements and duplicate decompression.
     let (roots, dropped) = dedup_roots(roots);
-    if !cli.json {
+    if !json {
         for (inner, outer) in &dropped {
             println!(
                 "{} {}",
@@ -1124,6 +1168,82 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
         }
     }
     let infos: Vec<RootInfo> = roots.iter().map(|r| RootInfo::new(r)).collect();
+    Ok((roots, infos))
+}
+
+pub(crate) fn make_spinner(json: bool) -> ProgressBar {
+    if json {
+        ProgressBar::hidden()
+    } else {
+        let sp = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
+        sp.set_style(ProgressStyle::with_template(tr().spinner_template()).unwrap());
+        sp.enable_steady_tick(Duration::from_millis(100));
+        sp
+    }
+}
+
+pub(crate) fn make_file_bar(
+    json: bool,
+    total: u64,
+    tracker: &Arc<Mutex<EtaTracker>>,
+) -> ProgressBar {
+    if json {
+        ProgressBar::hidden()
+    } else {
+        let b = ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr());
+        let style = ProgressStyle::with_template(tr().bar_files_template())
+            .unwrap()
+            .progress_chars("=> ")
+            .with_key("files_pos", {
+                let t = Arc::clone(tracker);
+                move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    let g = t.lock().unwrap();
+                    let _ = write!(w, "{}", g.done_files);
+                }
+            })
+            .with_key("files_len", {
+                let t = Arc::clone(tracker);
+                move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    let g = t.lock().unwrap();
+                    let _ = write!(w, "{}", g.total_files);
+                }
+            })
+            .with_key("smoothed_rate", {
+                let t = Arc::clone(tracker);
+                move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    let g = t.lock().unwrap();
+                    let _ = w.write_str(&g.format_rate(Instant::now()));
+                }
+            })
+            .with_key("smoothed_eta", {
+                let t = Arc::clone(tracker);
+                move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    let g = t.lock().unwrap();
+                    let _ = w.write_str(&g.format_eta(Instant::now()));
+                }
+            });
+        b.set_style(style);
+        b.enable_steady_tick(Duration::from_millis(200));
+        b
+    }
+}
+
+fn run(cli: &Cli) -> io::Result<ExitCode> {
+    if let Some(Command::Compact(args)) = &cli.command {
+        let global = compact::GlobalCliOpts {
+            verbose: cli.verbose,
+            json: cli.json,
+            exclude: &cli.exclude,
+        };
+        return compact::run(args, &global);
+    }
+    let raw_paths: Vec<PathBuf> =
+        if cli.paths.is_empty() { vec![PathBuf::from(".")] } else { cli.paths.clone() };
+    if cli.optimize {
+        return optimize::run(&raw_paths, cli.fix, cli.yes, cli.json);
+    }
+    let l = tr();
+    let (roots, infos) = resolve_scan_roots(&raw_paths, cli.json)?;
 
     // --- Phase 1: scan ----------------------------------------------------
     if !cli.json {
@@ -1135,14 +1255,7 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     }
 
     let started = Instant::now();
-    let spinner = if cli.json {
-        ProgressBar::hidden()
-    } else {
-        let sp = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
-        sp.set_style(ProgressStyle::with_template(l.spinner_template()).unwrap());
-        sp.enable_steady_tick(Duration::from_millis(100));
-        sp
-    };
+    let spinner = make_spinner(cli.json);
 
     let excludes = Excludes::new(cli)?;
     let mut scan = Scan::default();
@@ -1286,45 +1399,7 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     if !fix.interrupted && !scan.files.is_empty() {
         let total: u64 = scan.files.iter().map(|f| f.logical).sum();
         let tracker = Arc::new(Mutex::new(EtaTracker::from_candidates(&scan.files, Instant::now())));
-        let pb = if cli.json {
-            ProgressBar::hidden()
-        } else {
-            let b = ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr());
-            let style = ProgressStyle::with_template(l.bar_files_template())
-                .unwrap()
-                .progress_chars("=> ")
-                .with_key("files_pos", {
-                    let t = Arc::clone(&tracker);
-                    move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
-                        let g = t.lock().unwrap();
-                        let _ = write!(w, "{}", g.done_files);
-                    }
-                })
-                .with_key("files_len", {
-                    let t = Arc::clone(&tracker);
-                    move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
-                        let g = t.lock().unwrap();
-                        let _ = write!(w, "{}", g.total_files);
-                    }
-                })
-                .with_key("smoothed_rate", {
-                    let t = Arc::clone(&tracker);
-                    move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
-                        let g = t.lock().unwrap();
-                        let _ = w.write_str(&g.format_rate(Instant::now()));
-                    }
-                })
-                .with_key("smoothed_eta", {
-                    let t = Arc::clone(&tracker);
-                    move |_: &ProgressState, w: &mut dyn std::fmt::Write| {
-                        let g = t.lock().unwrap();
-                        let _ = w.write_str(&g.format_eta(Instant::now()));
-                    }
-                });
-            b.set_style(style);
-            b.enable_steady_tick(Duration::from_millis(200));
-            b
-        };
+        let pb = make_file_bar(cli.json, total, &tracker);
         for f in &scan.files {
             if INTERRUPTED.load(Ordering::SeqCst) {
                 fix.interrupted = true;
@@ -1843,7 +1918,7 @@ fn scan_tree(
     scan.excluded.extend(excluded.into_inner());
 }
 
-fn report_volume(info: &RootInfo) {
+pub(crate) fn report_volume(info: &RootInfo) {
     let l = tr();
     match &info.vol {
         Some(v) if !v.fs_name.eq_ignore_ascii_case("NTFS") => println!(
@@ -2036,7 +2111,7 @@ fn check_free_space(roots: &[PathBuf], files: &[Candidate]) -> io::Result<()> {
 }
 
 /// Asks a yes/no question; the accepted answers depend on the active language.
-fn confirm(prompt: &str) -> io::Result<bool> {
+pub(crate) fn confirm(prompt: &str) -> io::Result<bool> {
     if !io::stdin().is_terminal() {
         return Err(io::Error::other(tr().no_interactive_console()));
     }
@@ -2047,7 +2122,7 @@ fn confirm(prompt: &str) -> io::Result<bool> {
     Ok(tr().is_yes(&input))
 }
 
-fn file_name(p: &Path) -> String {
+pub(crate) fn file_name(p: &Path) -> String {
     p.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
@@ -2400,6 +2475,69 @@ mod tests {
         assert!(!raw_args_want_json_iter(a2));
 
         let cli = Cli::try_parse_from(["ntfs-unthrottle", "--fix", "--json"]).unwrap();
-        assert!(cli.fix && cli.json && !cli.yes);
+        assert!(cli.fix && cli.json && !cli.yes && cli.command.is_none());
+
+        let cli_def = Cli::try_parse_from(["ntfs-unthrottle"]).unwrap();
+        assert!(cli_def.command.is_none() && cli_def.paths.is_empty());
+
+        let cli_rec = Cli::try_parse_from([
+            "ntfs-unthrottle",
+            r"E:\",
+            "--recommended",
+            "--fix",
+        ])
+        .unwrap();
+        assert!(cli_rec.command.is_none() && cli_rec.recommended && cli_rec.fix);
+        assert_eq!(cli_rec.paths, vec![PathBuf::from(r"E:\")]);
+
+        let cli_opt = Cli::try_parse_from(["ntfs-unthrottle", r"E:\", "--optimize"]).unwrap();
+        assert!(cli_opt.command.is_none() && cli_opt.optimize);
+
+        let cli_compact = Cli::try_parse_from(["ntfs-unthrottle", "compact"]).unwrap();
+        assert!(matches!(cli_compact.command, Some(Command::Compact(_))));
+
+        let cli_compact_full = Cli::try_parse_from([
+            "ntfs-unthrottle",
+            "compact",
+            r"D:\Games",
+            "--profile",
+            "space",
+            "--min-size",
+            "8",
+            "--min-savings",
+            "15",
+            "--fix",
+            "--yes",
+            "--json",
+            "-x",
+            "temp",
+        ])
+        .unwrap();
+        assert!(cli_compact_full.json);
+        assert_eq!(cli_compact_full.exclude, vec!["temp".to_string()]);
+        let Some(Command::Compact(ca)) = cli_compact_full.command else {
+            panic!("expected compact subcommand");
+        };
+        assert_eq!(ca.paths, vec![PathBuf::from(r"D:\Games")]);
+        assert_eq!(ca.profile, compact::CompactProfile::Space);
+        assert_eq!(ca.min_size, 8);
+        assert!((ca.min_savings - 15.0).abs() < 1e-9);
+        assert!(ca.fix && ca.yes);
+
+        assert!(raw_args_want_json_iter([
+            OsStr::new("ntfs-unthrottle"),
+            OsStr::new("compact"),
+            OsStr::new("."),
+            OsStr::new("--json"),
+        ]));
+
+        // Top-level flags / paths must not silently mix with the compact subcommand,
+        // while explicit relative paths like `.\compact` and global flags still work.
+        assert!(Cli::try_parse_from(["ntfs-unthrottle", "--optimize", "compact"]).is_err());
+        assert!(Cli::try_parse_from(["ntfs-unthrottle", "--optimize", "compact", r"E:\"]).is_err());
+        assert!(Cli::try_parse_from(["ntfs-unthrottle", "compact", "--optimize"]).is_err());
+        assert!(Cli::try_parse_from(["ntfs-unthrottle", r"E:\", "compact"]).is_err());
+        assert!(Cli::try_parse_from(["ntfs-unthrottle", "--optimize", r".\compact"]).is_ok());
+        assert!(Cli::try_parse_from(["ntfs-unthrottle", "compact", "--json", "-v", "--lang", "de"]).is_ok());
     }
 }
