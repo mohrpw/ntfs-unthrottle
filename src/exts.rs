@@ -19,32 +19,36 @@ pub(crate) const HIGH_ENTROPY_EXTS: &[&str] = &[
     "docx", "docm", "dotx", "xlsx", "xlsm", "xltx", "pptx", "pptm", "potx",
     "vsdx", "vssx", "vstx", "onepkg", "odt", "ods", "odp", "odg", "odf",
     "wmz", "emz",
-    // Video
+    // Video (incl. compressed cinema RAW)
     "mp4", "mkv", "webm", "mov", "avi", "wmv", "bik", "bk2", "flv", "mpg",
     "mpeg", "m2v", "m4v", "vob", "ogv", "m2ts", "mts", "3gp", "3g2", "rmvb",
-    "rm", "asf", "f4v", "divx",
+    "rm", "asf", "f4v", "divx", "r3d",
     // Audio
     "mp3", "flac", "ogg", "opus", "aac", "wma", "m4a", "m4b", "m4p", "oga",
     "spx", "wv", "ape", "alac", "ac3", "dts", "amr",
-    // Images
+    // Images, compressed camera RAWs & supercompressed GPU textures
     "jpg", "jpeg", "png", "webp", "heic", "gif", "avif", "jxl", "heif", "hif",
-    "apng", "jp2", "j2k", "svgz",
+    "apng", "jp2", "j2k", "svgz", "cr2", "cr3", "basis",
     // Compressed web fonts
     "woff", "woff2",
     // Disk images & game asset containers
     "iso", "dmg", "chd", "rvz", "wbfs", "cso", "pak", "ucas", "utoc", "bundle", "vpk",
+    "bsa", "ba2",
+    // Quantized ML model containers (dense binary weights)
+    "gguf",
     // Encrypted containers
     "hc", "tc", "vc", "kdbx", "gpg", "pgp",
 ];
 
-/// `--recommended`: formats with many (random) writes. Compression fragments
-/// them heavily (up to `ERROR_FILE_SYSTEM_LIMITATION`) – always decompress.
+/// `--recommended`: formats with many (random) writes. WOF decompresses them
+/// transparently on write (causing watcher churn) and live DB compaction risks
+/// corruption without exclusive locking – always decompress.
 pub(crate) const WRITE_HEAVY_EXTS: &[&str] = &[
     // VM images & snapshots
     "vhd", "vhdx", "avhdx", "vmdk", "vdi", "qcow2", "vmem", "vmsn", "vmss", "nvram",
-    // Databases
-    "db", "db-wal", "db-shm", "sqlite", "sqlite3", "mdf", "ldf", "ndf", "edb", "ibd",
-    "mdb", "accdb", "ldb", "pst", "ost",
+    // Databases & SQLite WAL companion files
+    "db", "db-wal", "db-shm", "sqlite", "sqlite-wal", "sqlite-shm", "sqlite3",
+    "mdf", "ldf", "ndf", "edb", "ibd", "mdb", "accdb", "ldb", "pst", "ost",
     // Incomplete downloads (written block by block in random order)
     "part", "partial", "crdownload", "!qb", "!ut", "aria2",
 ];
@@ -84,19 +88,27 @@ mod tests {
             }
         }
 
-        // Newly added pre-compressed formats
+        // Existing & newly added high-entropy / write-heavy formats
         assert!(has_ext(Path::new(r"E:\Games\intro.BK2"), HIGH_ENTROPY_EXTS));
         assert!(has_ext(Path::new(r"C:\Docs\report.docx"), HIGH_ENTROPY_EXTS));
         assert!(has_ext(Path::new(r"C:\Web\font.woff2"), HIGH_ENTROPY_EXTS));
         assert!(has_ext(Path::new(r"C:\Pics\photo.avif"), HIGH_ENTROPY_EXTS));
         assert!(has_ext(Path::new(r"C:\Apps\app.msix"), HIGH_ENTROPY_EXTS));
+        assert!(has_ext(Path::new(r"E:\Photos\shot.CR3"), HIGH_ENTROPY_EXTS));
+        assert!(has_ext(Path::new(r"E:\Video\clip.r3d"), HIGH_ENTROPY_EXTS));
+        assert!(has_ext(Path::new(r"E:\Games\Skyrim\Data\Skyrim - Meshes0.bsa"), HIGH_ENTROPY_EXTS));
+        assert!(has_ext(Path::new(r"C:\Models\llama-8b-q4_k_m.gguf"), HIGH_ENTROPY_EXTS));
+        assert!(has_ext(Path::new(r"C:\Users\app\cache.sqlite-wal"), WRITE_HEAVY_EXTS));
 
-        // Uncompressed / ambiguous formats intentionally kept out
+        // Uncompressed / compressible / path-only formats intentionally kept out
         assert!(!has_ext(Path::new(r"E:\Archive\src.tar"), HIGH_ENTROPY_EXTS));
         assert!(!has_ext(Path::new(r"E:\Clipart\vec.wmf"), HIGH_ENTROPY_EXTS));
         assert!(!has_ext(Path::new(r"E:\Audio\raw.wav"), HIGH_ENTROPY_EXTS));
         assert!(!has_ext(Path::new(r"E:\Images\raw.bmp"), HIGH_ENTROPY_EXTS));
         assert!(!has_ext(Path::new(r"E:\Code\index.ts"), HIGH_ENTROPY_EXTS));
+        assert!(!has_ext(Path::new(r"E:\Textures\wall.dds"), HIGH_ENTROPY_EXTS));
+        assert!(!has_ext(Path::new(r"E:\Games\index.pck"), HIGH_ENTROPY_EXTS));
+        assert!(!has_ext(Path::new(r"C:\Models\resnet18.onnx"), HIGH_ENTROPY_EXTS));
+        assert!(!has_ext(Path::new(r"D:\Apps\lang\app.exe.mui"), COMPACT_SKIP_EXTS));
     }
 }
-
