@@ -346,10 +346,11 @@ Shared global flags `-v, --verbose`, `--json`, `-x, --exclude`, and `--lang` wor
 `--recommended` with `compact`.
 
 **Output language:** With `--lang auto`, the language is taken from `LC_ALL`, `LC_MESSAGES`
-or `LANG` (ignored if empty or `C`/`POSIX`), otherwise from the Windows UI language.
-German Windows → German output, everything else → English. The confirmation prompt accepts
-`y`/`yes` (English) or `j`/`ja`/`y`/`yes` (German). Want to add a language? See
-[CONTRIBUTING.md](CONTRIBUTING.md#adding-a-new-language-i18n).
+or `LANG` (ignored if empty or `C`/`POSIX`), otherwise from the Windows preferred UI languages
+(`GetUserPreferredUILanguages` with BCP-47 subtag fallback; unsupported languages fall back to
+English). Confirmation prompts accept locale-specific tokens (`y`/`yes` in English,
+`j`/`ja`/`y`/`yes` in German). Want to add a language? Just drop a single `locales/<lang>.toml`
+file – see [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-new-language-i18n).
 
 ---
 

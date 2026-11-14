@@ -354,9 +354,10 @@ Die globalen Optionen `-v, --verbose`, `--json`, `-x, --exclude` und `--lang` ge
 `--optimize` oder `--recommended` werden von `clap` abgewiesen.
 
 **Ausgabesprache:** Mit `--lang auto` gilt zuerst `LC_ALL`, `LC_MESSAGES` bzw. `LANG`
-(ignoriert, wenn leer oder `C`/`POSIX`), sonst die Windows-Anzeigesprache. Deutsches
-Windows → deutsche Ausgabe, alles andere → Englisch. Die Sicherheitsabfrage akzeptiert auf
-Deutsch `j`/`ja`/`y`/`yes`, auf Englisch `y`/`yes`. Eine weitere Sprache ergänzen? Siehe
+(ignoriert, wenn leer oder `C`/`POSIX`), sonst die bevorzugten Windows-Anzeigesprachen
+(`GetUserPreferredUILanguages` mit BCP-47-Subtag-Fallback; nicht unterstützte Sprachen fallen auf
+Englisch zurück). Die Sicherheitsabfrage akzeptiert auf Deutsch `j`/`ja`/`y`/`yes`, auf Englisch
+`y`/`yes`. Eine weitere Sprache ergänzen? Es genügt eine einzige Datei `locales/<lang>.toml` – siehe
 [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-new-language-i18n) (englisch).
 
 Für Dateien unter `C:\Program Files` o. Ä. das Terminal als Administrator starten.

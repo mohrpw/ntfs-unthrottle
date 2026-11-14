@@ -27,7 +27,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use serde_json::{json, Map, Value};
 use walkdir::WalkDir;
 
-use i18n::{tr, LangChoice};
+use i18n::tr;
 use ntfs_unthrottle::{
     compressed_ancestors, display_path, file_identity_of, fragment_count,
     fragment_count_of, is_system_drive_root, open_for_query, physical_size, remove_compression,
@@ -236,8 +236,14 @@ struct Cli {
 
     /// Output language of runtime messages (auto = LC_ALL/LC_MESSAGES/LANG,
     /// then the Windows UI language). --help is always English.
-    #[arg(long, value_enum, value_name = "LANG", default_value_t = LangChoice::Auto, global = true)]
-    lang: LangChoice,
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(i18n::CLI_LANG_CHOICES),
+        value_name = "LANG",
+        default_value = "auto",
+        global = true
+    )]
+    lang: String,
 }
 
 impl Cli {
@@ -386,7 +392,11 @@ impl Excludes {
                     // What does not exist cannot be scanned either – no reason to abort.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
                         if !json {
-                            eprintln!("{} {}", style("ℹ").blue().bold(), tr().exclude_missing(x));
+                            eprintln!(
+                                "{} {}",
+                                style("ℹ").blue().bold(),
+                                tr().scan_exclude_missing(&x)
+                            );
                         }
                         continue;
                     }
@@ -1077,13 +1087,13 @@ fn main() -> ExitCode {
             e.exit();
         }
     };
-    i18n::init(i18n::detect(cli.lang));
+    i18n::init(i18n::detect(&cli.lang));
     let needs_yes = match &cli.command {
         Some(Command::Compact(c)) => c.fix && !c.yes,
         None => cli.fix && !cli.yes,
     };
     if cli.json && needs_yes {
-        emit_json_error(tr().json_fix_requires_yes());
+        emit_json_error(tr().scan_json_fix_requires_yes());
         return ExitCode::from(2);
     }
     match run(&cli) {
@@ -1113,10 +1123,13 @@ pub(crate) fn resolve_scan_roots(paths: &[PathBuf], json: bool) -> io::Result<(V
         let check = canon.as_deref().unwrap_or(&abs);
         if let Some((hit, why)) = protected_path(&abs).or_else(|| protected_path(check)) {
             if !json {
+                let abs_d = display_path(&abs);
+                let why_s = l.protected(why);
+                let hit_d = display_path(&hit);
                 eprintln!(
                     "{} {}",
                     style("⛔").red().bold(),
-                    l.skipped_protected(display_path(&abs), l.protected(why), display_path(&hit))
+                    l.scan_skipped_protected(&abs_d, &why_s, &hit_d)
                 );
             }
             continue;
@@ -1124,17 +1137,19 @@ pub(crate) fn resolve_scan_roots(paths: &[PathBuf], json: bool) -> io::Result<(V
         roots.push(canon.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", p.display())))?);
     }
     if roots.is_empty() {
-        return Err(io::Error::other(l.no_paths_left()));
+        return Err(io::Error::other(l.scan_no_paths_left()));
     }
     // Scan overlapping paths only once – otherwise duplicate candidates,
     // duplicate space requirements and duplicate decompression.
     let (roots, dropped) = dedup_roots(roots);
     if !json {
         for (inner, outer) in &dropped {
+            let inner_d = display_path(inner);
+            let outer_d = display_path(outer);
             println!(
                 "{} {}",
                 style("ℹ").blue().bold(),
-                l.root_contained(display_path(inner), display_path(outer))
+                l.scan_root_contained(&inner_d, &outer_d)
             );
         }
     }
@@ -1147,7 +1162,8 @@ pub(crate) fn make_spinner(json: bool) -> ProgressBar {
         ProgressBar::hidden()
     } else {
         let sp = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
-        sp.set_style(ProgressStyle::with_template(tr().spinner_template()).unwrap());
+        let tmpl = format!("{{spinner:.cyan}} {{pos}} {}  {{wide_msg:.dim}}", tr().scan_spinner_entries());
+        sp.set_style(ProgressStyle::with_template(&tmpl).unwrap());
         sp.enable_steady_tick(Duration::from_millis(100));
         sp
     }
@@ -1161,8 +1177,13 @@ pub(crate) fn make_file_bar(
     if json {
         ProgressBar::hidden()
     } else {
+        let l = tr();
         let b = ProgressBar::with_draw_target(Some(total), ProgressDrawTarget::stderr());
-        let style = ProgressStyle::with_template(tr().bar_files_template())
+        let tmpl = format!(
+            "  {} [{{bar:30.green/white}}] {{files_pos}}/{{files_len}} {{bytes}}/{{total_bytes}} {{smoothed_rate}} ETA {{smoothed_eta}}  {{wide_msg:.dim}}",
+            l.scan_bar_files_label_label().pad(l.col_width_bar_labels)
+        );
+        let style = ProgressStyle::with_template(&tmpl)
             .unwrap()
             .progress_chars("=> ")
             .with_key("files_pos", {
@@ -1218,7 +1239,11 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
 
     // --- Phase 1: scan ----------------------------------------------------
     if !cli.json {
-        println!("{} {}", style("[1/3]").bold().cyan(), l.scanning_paths(roots.len()));
+        println!(
+            "{} {}",
+            style("[1/3]").bold().cyan(),
+            l.scan_scanning_paths(roots.len() as u64)
+        );
         for (root, info) in roots.iter().zip(&infos) {
             println!("      {}", style(display_path(root)).underlined());
             report_volume(info);
@@ -1254,14 +1279,15 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
         v
     };
     if !cli.json && !ancestors.is_empty() {
-        println!("\n  {} {}", style("⚠").yellow().bold(), l.ancestors_flagged());
+        println!("\n  {} {}", style("⚠").yellow().bold(), l.scan_ancestors_flagged());
         for a in &ancestors {
             if a.parent().is_none() {
                 // Drive root: intentionally not changed automatically.
+                let a_d = display_path(a);
                 println!(
                     "      {}  {}",
-                    display_path(a),
-                    style(l.drive_root_flag_hint(display_path(a))).dim()
+                    a_d,
+                    style(l.scan_drive_root_flag_hint(&a_d)).dim()
                 );
             } else {
                 println!("      {}", display_path(a));
@@ -1284,7 +1310,12 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
                 fix: empty_fix.as_ref(),
             })?;
         } else {
-            println!("\n{} {}", style("✔").green().bold(), l.nothing_found(notes.any_hint()));
+            let msg = if notes.any_hint() {
+                l.scan_nothing_found_see_hints()
+            } else {
+                l.scan_nothing_found()
+            };
+            println!("\n{} {}", style("✔").green().bold(), msg);
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -1302,39 +1333,45 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
                 fix: None,
             })?;
         } else {
+            let flag = style("--fix").yellow().bold();
             println!(
                 "\n{} {}",
                 style("ℹ").blue().bold(),
-                l.analysis_only_fix(style("--fix").yellow().bold())
+                l.scan_analysis_only_fix(&flag)
             );
         }
         return Ok(ExitCode::from(EXIT_FOUND));
     }
 
     if !cli.json {
-        print!("\n  {}", l.checking_free_space());
+        print!("\n  {}", l.scan_checking_free_space());
         io::stdout().flush()?;
     }
     check_free_space(&roots, &scan.files)?;
     if !cli.json {
-        println!(" ok");
+        println!(" {}", l.general_status_ok());
     }
 
     if !cli.yes {
+        let files_m = l.noun_file(scan.files.len() as u64);
+        let dirs_m = l.noun_folder(dirs_todo as u64);
+        let yn = l.yes_no();
         let prompt = format!(
             "\n{}\n{} ",
             style("─".repeat(60)).yellow(),
-            style(l.confirm_decompress(scan.files.len(), dirs_todo)).yellow().bold()
+            style(l.scan_confirm_decompress(&files_m, &dirs_m, &yn))
+                .yellow()
+                .bold()
         );
         if !confirm(&prompt)? {
-            println!("{}", l.aborted());
+            println!("{}", l.general_aborted());
             return Ok(ExitCode::SUCCESS);
         }
     }
 
     // --- Phase 3: cleanup ------------------------------------------------
     if !cli.json {
-        println!("\n{} {}", style("[3/3]").bold().cyan(), l.cleaning_up());
+        println!("\n{} {}", style("[3/3]").bold().cyan(), l.scan_cleaning_up());
     }
     let _ctrl_guard = CtrlHandlerGuard::install();
     let mut fix = FixSummary { dirs_todo, files_todo: scan.files.len(), ..Default::default() };
@@ -1345,7 +1382,11 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
             ProgressBar::hidden()
         } else {
             let b = ProgressBar::with_draw_target(Some(dirs_todo as u64), ProgressDrawTarget::stderr());
-            b.set_style(ProgressStyle::with_template(l.bar_dirs_template()).unwrap());
+            let tmpl = format!(
+                "  {} [{{bar:30.cyan/blue}}] {{pos}}/{{len}}",
+                l.scan_bar_dirs_label_label().pad(l.col_width_bar_labels)
+            );
+            b.set_style(ProgressStyle::with_template(&tmpl).unwrap());
             b
         };
         for dir in &scan.dirs {
@@ -1423,35 +1464,47 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
         })?;
     } else {
         if fix.interrupted {
-            eprintln!("\n  {} {}", style("⚠").yellow().bold(), l.interrupted_partial());
+            eprintln!("\n  {} {}", style("⚠").yellow().bold(), l.scan_interrupted_partial());
         }
-        println!("\n{}", style(l.result_header()).bold());
+        println!("\n{}", style(l.scan_result_header()).bold());
         if dirs_todo > 0 {
-            println!("  {} {:<23}{}/{}", style("✔").green(), l.result_dir_flags(), fix.fixed_dirs, dirs_todo);
+            println!(
+                "  {} {}{}/{}",
+                style("✔").green(),
+                l.scan_result_dir_flags_label().pad(l.col_width_scan_result),
+                l.int(fix.fixed_dirs as u64),
+                l.int(dirs_todo as u64)
+            );
         }
         println!(
-            "  {} {:<23}{}/{}",
+            "  {} {}{}/{}",
             style("✔").green(),
-            l.result_files(),
-            fix.fixed_files,
-            scan.files.len()
+            l.scan_result_files_label().pad(l.col_width_scan_result),
+            l.int(fix.fixed_files as u64),
+            l.int(scan.files.len() as u64)
         );
         if fix.freed_fragments > 0 {
-            println!("  {} {:<23}{}", style("✔").green(), l.result_fragments(), fix.freed_fragments);
+            println!(
+                "  {} {}{}",
+                style("✔").green(),
+                l.scan_result_fragments_label().pad(l.col_width_scan_result),
+                l.int(fix.freed_fragments)
+            );
         }
 
         if !fix.heavily_fragmented.is_empty() {
             println!(
                 "\n  {} {}",
                 style("ℹ").blue().bold(),
-                l.heavily_fragmented_header(fix.heavily_fragmented.len())
+                l.scan_heavily_fragmented_header(fix.heavily_fragmented.len() as u64)
             );
             let shown = if cli.verbose { fix.heavily_fragmented.len() } else { 5 };
             for (_, p, frags) in fix.heavily_fragmented.iter().take(shown) {
-                println!("    {:>6}  {}", frags, l.heavily_fragmented_hint_contig(display_path(p)));
+                println!("    {:>6}  contig.exe \"{}\"", l.int(*frags).to_string(), display_path(p));
             }
             if fix.heavily_fragmented.len() > shown {
-                println!("    {}", l.more_items(fix.heavily_fragmented.len() - shown));
+                let rem = l.int((fix.heavily_fragmented.len() - shown) as u64);
+                println!("    {}", l.general_more_items(&rem));
             }
             let mut seen_vols = Vec::new();
             for (r_idx, _, _) in &fix.heavily_fragmented {
@@ -1463,18 +1516,23 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
                 }
             }
             for v in seen_vols {
-                println!("    {}", style(l.heavily_fragmented_hint_defrag(&v)).dim());
+                println!("    {}", style(l.scan_heavily_fragmented_hint_defrag(&v)).dim());
             }
         }
 
         if !fix.failed.is_empty() {
-            println!("\n  {} {}", style("⚠").yellow().bold(), l.items_failed(fix.failed.len()));
+            println!(
+                "\n  {} {}",
+                style("⚠").yellow().bold(),
+                l.scan_items_failed(fix.failed.len() as u64)
+            );
             let shown = if cli.verbose { fix.failed.len() } else { 10 };
             for (p, why) in fix.failed.iter().take(shown) {
                 println!("    - {}: {}", display_path(p), style(why).red());
             }
             if fix.failed.len() > shown {
-                println!("    {}", l.more_items(fix.failed.len() - shown));
+                let rem = l.int((fix.failed.len() - shown) as u64);
+                println!("    {}", l.general_more_items(&rem));
             }
         }
     }
@@ -1892,60 +1950,109 @@ fn scan_tree(
 pub(crate) fn report_volume(info: &RootInfo) {
     let l = tr();
     match &info.vol {
-        Some(v) if !v.fs_name.eq_ignore_ascii_case("NTFS") => println!(
-            "      {} {}",
-            style("ℹ").blue(),
-            l.fs_without_wof(&v.fs_name, v.supports_compression)
-        ),
+        Some(v) if !v.fs_name.eq_ignore_ascii_case("NTFS") => {
+            let msg = if v.supports_compression {
+                l.scan_fs_without_wof(&v.fs_name)
+            } else {
+                l.scan_fs_without_wof_no_comp(&v.fs_name)
+            };
+            println!("      {} {msg}", style("ℹ").blue());
+        }
         Some(v) if !v.supports_compression => {
-            println!("      {} {}", style("ℹ").blue(), l.ntfs_large_clusters());
+            println!("      {} {}", style("ℹ").blue(), l.scan_ntfs_large_clusters());
         }
         Some(_) => {}
-        None => println!("      {} {}", style("⚠").yellow(), l.volume_info_unreadable()),
+        None => println!("      {} {}", style("⚠").yellow(), l.scan_volume_info_unreadable()),
     }
     if let Some(d) = &info.dev {
         let kind = match d.seek_penalty {
             Some(true) => "HDD",
             Some(false) => "SSD",
-            None => l.generic_drive(),
+            None => l.scan_generic_drive(),
         };
-        let bus = d.bus.map(|b| format!("{}-", l.bus(b))).unwrap_or_default();
+        let bus = d.bus.map(|b| format!("{}-", l.bus_name(b))).unwrap_or_default();
         let product = d.product.as_deref().map(|p| format!(" ({p})")).unwrap_or_default();
-        println!("      {}", style(l.drive_line(format!("{bus}{kind}{product}"))).dim());
+        let desc = format!("{bus}{kind}{product}");
+        println!("      {}", style(l.scan_drive_line(&desc)).dim());
     }
+}
+
+fn print_multiline_indented(first_prefix: &str, rest_prefix: &str, disp: impl std::fmt::Display) {
+    use std::fmt::Write as _;
+    struct IndentOut<'a> {
+        out: io::StdoutLock<'a>,
+        first: &'a str,
+        rest: &'a str,
+        at_line_start: bool,
+        first_line: bool,
+    }
+    impl std::fmt::Write for IndentOut<'_> {
+        fn write_str(&mut self, mut s: &str) -> std::fmt::Result {
+            while !s.is_empty() {
+                if self.at_line_start {
+                    let prefix = if self.first_line { self.first } else { self.rest };
+                    self.out.write_all(prefix.as_bytes()).map_err(|_| std::fmt::Error)?;
+                    self.at_line_start = false;
+                    self.first_line = false;
+                }
+                match s.find('\n') {
+                    Some(idx) => {
+                        self.out.write_all(&s.as_bytes()[..idx + 1]).map_err(|_| std::fmt::Error)?;
+                        s = &s[idx + 1..];
+                        self.at_line_start = true;
+                    }
+                    None => {
+                        self.out.write_all(s.as_bytes()).map_err(|_| std::fmt::Error)?;
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut w = IndentOut {
+        out: io::stdout().lock(),
+        first: first_prefix,
+        rest: rest_prefix,
+        at_line_start: true,
+        first_line: true,
+    };
+    let _ = writeln!(w, "{disp}");
 }
 
 /// ⚠/ℹ blocks of the storage media rules (after the summary).
 fn print_storage_notes(notes: &StorageNotes) {
     let l = tr();
     for (g, n, bytes) in &notes.ds_kept {
+        let g_disp = display_path(g);
+        let styled_game = style(&g_disp).bold();
         println!(
             "\n  {} {}",
             style("⚠").yellow().bold(),
-            l.ds_detected(style(display_path(g)).bold())
+            l.ds_detected(&styled_game)
         );
-        println!("{}", l.ds_kept_body(*n, format_size(*bytes, BINARY)));
+        let size_s = format_size(*bytes, BINARY);
+        print_multiline_indented("      ", "      ", l.ds_kept_body(*n, &size_s));
+        let flag = style("--recommended").yellow();
         println!(
             "      {}",
-            l.ds_decompress_hint(style("--recommended").yellow(), display_path(g))
+            l.ds_decompress_hint(&flag, &g_disp)
         );
     }
     for NvmeHeavy { vol, total, dirs } in &notes.nvme_heavy {
-        println!(
-            "\n  {} {}",
-            style("ℹ").blue().bold(),
-            l.nvme_heavy(display_path(vol), format_size(*total, BINARY))
-        );
-        println!("{}", l.nvme_heavy_body());
+        let vol_disp = display_path(vol);
+        let total_s = format_size(*total, BINARY);
+        let icon = format!("\n  {} ", style("ℹ").blue().bold());
+        print_multiline_indented(&icon, "      ", l.ds_nvme_heavy(&vol_disp, &total_s));
         for (d, b) in dirs {
             println!("        {:>10}  {}", format_size(*b, BINARY), display_path(d));
         }
     }
 }
 
-/// One summary row: `  • <label padded> <value>`.
-fn row(label: &str, value: impl std::fmt::Display) {
-    println!("  • {label:<34}{value}");
+/// One summary row: `  • <label padded><value>`.
+fn row(label: impl std::fmt::Display, value: impl std::fmt::Display) {
+    println!("  • {label}{value}");
 }
 
 fn print_report(cli: &Cli, scan: &Scan, notes: &StorageNotes, took: Duration) {
@@ -1953,55 +2060,91 @@ fn print_report(cli: &Cli, scan: &Scan, notes: &StorageNotes, took: Duration) {
     let logical: u64 = scan.files.iter().map(|f| f.logical).sum();
     let physical: u64 = scan.files.iter().map(|f| f.physical).sum();
 
+    let secs_d = l.decimal(took.as_secs_f64(), 1);
     println!(
         "\n{} {}",
         style("[2/3]").bold().cyan(),
-        l.analysis_header(scan.entries, took.as_secs_f64())
+        l.report_analysis_header(scan.entries, &secs_d)
     );
+    let dirs_total = scan.dirs_filtered_from.unwrap_or(scan.dirs.len()) as u64;
+    let only_note = scan
+        .dirs_filtered_from
+        .map(|_| {
+            let kept = l.int(scan.dirs.len() as u64);
+            l.report_only_dirs_filtered_note(&kept).to_string()
+        })
+        .unwrap_or_default();
     row(
-        l.lbl_compressed_dirs(),
+        l.report_lbl_compressed_dirs_label().pad(l.col_width_scan_summary),
         format!(
             "{}{}{}",
-            style(scan.dirs_filtered_from.unwrap_or(scan.dirs.len())).yellow().bold(),
-            if cli.keep_dir_flags { l.keep_dir_flags_note() } else { "" },
-            scan.dirs_filtered_from
-                .map(|_| l.only_dirs_filtered_note(scan.dirs.len()))
-                .unwrap_or_default()
+            style(l.int(dirs_total)).yellow().bold(),
+            if cli.keep_dir_flags { l.report_keep_dir_flags_note() } else { "" },
+            only_note
         ),
     );
-    row(l.lbl_throttled_files(), style(scan.files.len()).yellow().bold());
+    row(
+        l.report_lbl_throttled_files_label().pad(l.col_width_scan_summary),
+        style(l.int(scan.files.len() as u64)).yellow().bold(),
+    );
     if !scan.files.is_empty() {
+        let log_s = format_size(logical, BINARY);
+        let phys_s = format_size(physical, BINARY);
         row(
-            l.lbl_data_volume(),
-            l.data_volume(format_size(logical, BINARY), format_size(physical, BINARY)),
+            l.report_lbl_data_volume_label().pad(l.col_width_scan_summary),
+            l.report_data_volume(&log_s, &phys_s),
         );
         row(
-            l.lbl_extra_space(),
+            l.report_lbl_extra_space_label().pad(l.col_width_scan_summary),
             style(format_size(logical.saturating_sub(physical), BINARY)).bold(),
         );
     }
     if scan.kept_files > 0 {
-        row(l.lbl_kept(), l.kept_files(scan.kept_files, format_size(scan.kept_bytes_saved, BINARY)));
+        let saved_s = format_size(scan.kept_bytes_saved, BINARY);
+        row(
+            l.report_lbl_kept_label().pad(l.col_width_scan_summary),
+            l.report_kept_files(scan.kept_files, &saved_s),
+        );
     }
     // Intentionally outside of `kept_files > 0`: if --recommended moved all WOF
     // files, kept_files is 0 – the row should still appear.
     for (g, n) in &notes.ds_moved {
-        row(l.lbl_ds_detected(), l.ds_moved(display_path(g), *n));
+        let g_disp = display_path(g);
+        row(
+            l.report_lbl_ds_detected_label().pad(l.col_width_scan_summary),
+            l.report_ds_moved(*n, &g_disp),
+        );
     }
     if scan.small_compressed > 0 {
-        row(&l.lbl_small(cli.min_size), l.small_ignored(scan.small_compressed));
+        let small_n = l.int(scan.small_compressed);
+        row(
+            l.report_lbl_small(&cli.min_size).pad_with(
+                crate::i18n::runtime::decimal_digits(cli.min_size),
+                l.col_width_scan_summary,
+            ),
+            l.report_small_ignored(&small_n),
+        );
         if !cli.recommended && !cli.effective_all() && cli.only.is_empty() {
-            println!("    {}", style(l.tip_recommended()).dim());
+            println!("    {}", style(l.report_tip_recommended()).dim());
         }
     }
     if scan.hardlink_dupes > 0 {
-        row(l.lbl_hardlink_dupes(), scan.hardlink_dupes);
+        row(
+            l.report_lbl_hardlink_dupes_label().pad(l.col_width_scan_summary),
+            l.int(scan.hardlink_dupes),
+        );
     }
     if scan.cloud_skipped > 0 {
-        row(l.lbl_cloud_skipped(), scan.cloud_skipped);
+        row(
+            l.report_lbl_cloud_skipped_label().pad(l.col_width_scan_summary),
+            l.int(scan.cloud_skipped),
+        );
     }
     if scan.sparse_skipped > 0 {
-        row(l.lbl_sparse_skipped(), scan.sparse_skipped);
+        row(
+            l.report_lbl_sparse_skipped_label().pad(l.col_width_scan_summary),
+            l.int(scan.sparse_skipped),
+        );
     }
     if !scan.excluded.is_empty() {
         let names: Vec<String> = scan
@@ -2012,7 +2155,7 @@ fn print_report(cli: &Cli, scan: &Scan, notes: &StorageNotes, took: Duration) {
             .collect();
         let more = scan.excluded.len().saturating_sub(names.len());
         row(
-            l.lbl_excluded(),
+            l.report_lbl_excluded_label().pad(l.col_width_scan_summary),
             format!(
                 "{}{}",
                 names.join(", "),
@@ -2021,32 +2164,46 @@ fn print_report(cli: &Cli, scan: &Scan, notes: &StorageNotes, took: Duration) {
         );
     }
     if scan.errors > 0 {
-        row(l.lbl_unreadable(), style(scan.errors).dim());
+        row(
+            l.report_lbl_unreadable_label().pad(l.col_width_scan_summary),
+            style(l.int(scan.errors)).dim(),
+        );
     }
     print_storage_notes(notes);
 
     if !scan.files.is_empty() {
         let shown = if cli.verbose { scan.files.len() } else { 10 };
-        let [size, phys, kind, frags, reason, path] = l.table_columns();
-        println!("\n  {size:>10}  {phys:>6}  {kind:<15} {frags:>9}  {reason:<14} {path}");
+        println!(
+            "\n  {}  {}  {}{}  {}{}",
+            l.report_col_size_label().pad_left(l.col_width_scan_table_size),
+            l.report_col_phys_label().pad_left(l.col_width_scan_table_phys),
+            l.report_col_type_label().pad(l.col_width_scan_table_type),
+            l.report_col_frags_label().pad_left(l.col_width_scan_table_frags),
+            l.report_col_reason_label().pad(l.col_width_scan_table_reason),
+            l.report_col_path()
+        );
         for f in scan.files.iter().take(shown) {
             println!(
-                "  {:>10}  {:>5.1}%  {:<15} {:>9}  {:<14} {}",
+                "  {:>w_size$}  {}  {:<w_type$}{:>w_frags$}  {}{}",
                 format_size(f.logical, BINARY),
-                f.ratio(),
+                l.decimal(f.ratio(), 1).pad_left_suffix("%", l.col_width_scan_table_phys),
                 f.kind.to_string(),
-                f.fragments.map_or_else(|| "–".into(), |n| n.to_string()),
-                l.reason(f.reason),
-                display_path(&f.path)
+                f.fragments.map_or_else(|| "–".into(), |n| l.int(n).to_string()),
+                l.reason_label(f.reason).pad(l.col_width_scan_table_reason),
+                display_path(&f.path),
+                w_size = l.col_width_scan_table_size,
+                w_type = l.col_width_scan_table_type,
+                w_frags = l.col_width_scan_table_frags,
             );
         }
         if scan.files.len() > shown {
-            println!("  {}", l.more_items(scan.files.len() - shown));
+            let rem = l.int((scan.files.len() - shown) as u64);
+            println!("  {}", l.general_more_items(&rem));
         }
     }
 
     if cli.verbose && !scan.dirs.is_empty() {
-        println!("\n  {}", l.compressed_dirs_list());
+        println!("\n  {}", l.report_compressed_dirs_list());
         for d in &scan.dirs {
             println!("    {}", display_path(d));
         }
@@ -2068,13 +2225,12 @@ fn check_free_space(roots: &[PathBuf], files: &[Candidate]) -> io::Result<()> {
         let Some(info) = info else { continue };
         let margin = (256 * 1024 * 1024).max(bytes / 100);
         if info.free_bytes < bytes + margin {
+            let root_d = display_path(&root);
+            let free_s = format_size(info.free_bytes, BINARY);
+            let need_s = format_size(bytes + margin, BINARY);
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
-                tr().not_enough_space(
-                    display_path(&root),
-                    format_size(info.free_bytes, BINARY),
-                    format_size(bytes + margin, BINARY),
-                ),
+                tr().scan_not_enough_space(&root_d, &free_s, &need_s).to_string(),
             ));
         }
     }
@@ -2084,7 +2240,7 @@ fn check_free_space(roots: &[PathBuf], files: &[Candidate]) -> io::Result<()> {
 /// Asks a yes/no question; the accepted answers depend on the active language.
 pub(crate) fn confirm(prompt: &str) -> io::Result<bool> {
     if !io::stdin().is_terminal() {
-        return Err(io::Error::other(tr().no_interactive_console()));
+        return Err(io::Error::other(tr().general_no_interactive_console()));
     }
     print!("{prompt}");
     io::stdout().flush()?;

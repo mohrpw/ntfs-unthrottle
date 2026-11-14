@@ -366,7 +366,7 @@ pub fn run(args: &CompactArgs, global: &GlobalCliOpts<'_>) -> io::Result<ExitCod
         println!(
             "{} {}",
             style("[1/3]").bold().cyan(),
-            l.scanning_paths(roots.len())
+            l.scan_scanning_paths(roots.len() as u64)
         );
         for ((root, info), (eff, qlc_auto)) in roots.iter().zip(&infos).zip(&profiles) {
             println!("      {}", style(display_path(root)).underlined());
@@ -381,10 +381,14 @@ pub fn run(args: &CompactArgs, global: &GlobalCliOpts<'_>) -> io::Result<ExitCod
                     continue;
                 }
             }
-            println!(
-                "      {}",
-                style(l.compact_profile_line(args.profile.as_str(), eff.as_str(), *qlc_auto)).dim()
-            );
+            let req = args.profile.as_str();
+            let eff_s = eff.as_str();
+            let line = if *qlc_auto {
+                style(l.compact_profile_line_qlc(&req, &eff_s)).dim()
+            } else {
+                style(l.compact_profile_line(&req, &eff_s)).dim()
+            };
+            println!("      {line}");
         }
     }
 
@@ -525,10 +529,11 @@ pub fn run(args: &CompactArgs, global: &GlobalCliOpts<'_>) -> io::Result<ExitCod
                 None,
             )?;
         } else {
+            let flag = style("--fix").yellow().bold();
             println!(
                 "\n{} {}",
                 style("ℹ").blue().bold(),
-                l.compact_analysis_only(style("--fix").yellow().bold())
+                l.compact_analysis_only(&flag)
             );
         }
         return Ok(ExitCode::from(EXIT_FOUND));
@@ -536,15 +541,17 @@ pub fn run(args: &CompactArgs, global: &GlobalCliOpts<'_>) -> io::Result<ExitCod
 
     let total_est_saved: u64 = scan.candidates.iter().map(|c| c.plan.est_saved_bytes).sum();
     if !args.yes {
+        let est_saved = format_size(total_est_saved, BINARY);
+        let yn = l.yes_no();
         let prompt = format!(
             "\n{}\n{} ",
             style("─".repeat(60)).yellow(),
-            style(l.compact_confirm(scan.candidates.len(), format_size(total_est_saved, BINARY)))
+            style(l.compact_confirm(scan.candidates.len() as u64, &est_saved, &yn))
                 .yellow()
                 .bold()
         );
         if !confirm(&prompt)? {
-            println!("{}", l.aborted());
+            println!("{}", l.general_aborted());
             return Ok(ExitCode::SUCCESS);
         }
     }
@@ -637,57 +644,57 @@ pub fn run(args: &CompactArgs, global: &GlobalCliOpts<'_>) -> io::Result<ExitCod
             eprintln!(
                 "\n  {} {}",
                 style("⚠").yellow().bold(),
-                l.interrupted_partial()
+                l.scan_interrupted_partial()
             );
         }
-        println!("\n{}", style(l.result_header()).bold());
+        println!("\n{}", style(l.scan_result_header()).bold());
         println!(
-            "  {} {:<34}{}/{}",
+            "  {} {}{}/{}",
             style("✔").green(),
-            l.compact_result_compressed(),
-            fix.compressed_files,
-            fix.files_todo
+            l.compact_result_compressed_label().pad(l.col_width_compact_result),
+            l.int(fix.compressed_files as u64),
+            l.int(fix.files_todo as u64)
         );
         if fix.bytes_before > 0 {
+            let before_s = format_size(fix.bytes_before, BINARY);
+            let after_s = format_size(fix.bytes_after, BINARY);
+            let saved_s = format_size(fix.actual_saved(), BINARY);
             println!(
-                "  {} {:<34}{}",
+                "  {} {}{}",
                 style("✔").green(),
-                l.compact_result_actual_saved(),
-                l.compact_saved_val(
-                    format_size(fix.bytes_before, BINARY),
-                    format_size(fix.bytes_after, BINARY),
-                    format_size(fix.actual_saved(), BINARY),
-                )
+                l.compact_result_actual_saved_label().pad(l.col_width_compact_result),
+                l.compact_saved_val(&before_s, &after_s, &saved_s)
             );
         }
         if fix.not_beneficial > 0 {
             println!(
-                "  {} {:<34}{}",
+                "  {} {}{}",
                 style("ℹ").blue(),
-                l.compact_result_not_beneficial(),
-                fix.not_beneficial
+                l.compact_result_not_beneficial_label().pad(l.col_width_compact_result),
+                l.int(fix.not_beneficial as u64)
             );
         }
         if fix.insufficient_space_skipped > 0 {
             println!(
-                "  {} {:<34}{}",
+                "  {} {}{}",
                 style("⚠").yellow(),
-                l.compact_result_space_skipped(),
-                fix.insufficient_space_skipped
+                l.compact_result_space_skipped_label().pad(l.col_width_compact_result),
+                l.int(fix.insufficient_space_skipped as u64)
             );
         }
         if !fix.failed.is_empty() {
             println!(
                 "\n  {} {}",
                 style("⚠").yellow().bold(),
-                l.items_failed(fix.failed.len())
+                l.scan_items_failed(fix.failed.len() as u64)
             );
             let shown = if global.verbose { fix.failed.len() } else { 10 };
             for (p, why) in fix.failed.iter().take(shown) {
                 println!("    - {}: {}", display_path(p), style(why).red());
             }
             if fix.failed.len() > shown {
-                println!("    {}", l.more_items(fix.failed.len() - shown));
+                let rem = l.int((fix.failed.len() - shown) as u64);
+                println!("    {}", l.general_more_items(&rem));
             }
         }
     }
@@ -825,8 +832,8 @@ fn walk_compact_root(
     scan.excluded.extend(excluded.into_inner());
 }
 
-fn row(label: &str, value: impl std::fmt::Display) {
-    println!("  • {label:<34}{value}");
+fn row(label: impl std::fmt::Display, value: impl std::fmt::Display) {
+    println!("  • {label}{value}");
 }
 
 const ALG_ORDER: [WofAlgorithm; 4] = [
@@ -860,61 +867,92 @@ fn print_compact_report(
         total_est_saved as f64 / total_baseline as f64 * 100.0
     };
 
+    let secs_d = l.decimal(took.as_secs_f64(), 1);
     println!(
         "\n{} {}",
         style("[2/3]").bold().cyan(),
-        l.analysis_header(scan.entries, took.as_secs_f64())
+        l.report_analysis_header(scan.entries, &secs_d)
     );
     row(
-        l.compact_lbl_candidates(),
-        style(scan.candidates.len()).yellow().bold(),
+        l.compact_lbl_candidates_label().pad(l.col_width_compact_summary),
+        style(l.int(scan.candidates.len() as u64)).yellow().bold(),
     );
     if !scan.candidates.is_empty() {
+        let saved_s = format_size(total_est_saved, BINARY);
+        let pct_d = l.decimal(pct, 1);
         row(
-            l.compact_lbl_est_savings(),
-            style(l.compact_est_savings_val(
-                format_size(total_est_saved, BINARY),
-                pct,
-                total_est_clusters,
-            ))
-            .bold(),
+            l.compact_lbl_est_savings_label().pad(l.col_width_compact_summary),
+            style(l.compact_est_savings_val(total_est_clusters, &saved_s, &pct_d)).bold(),
         );
     }
     if scan.already_wof > 0 {
-        row(l.compact_lbl_already_wof(), scan.already_wof);
+        row(
+            l.compact_lbl_already_wof_label().pad(l.col_width_compact_summary),
+            l.int(scan.already_wof),
+        );
     }
     if scan.ds_skipped > 0 {
-        row(l.compact_lbl_ds_skipped(), scan.ds_skipped);
+        row(
+            l.compact_lbl_ds_skipped_label().pad(l.col_width_compact_summary),
+            l.int(scan.ds_skipped),
+        );
     }
     if scan.packed_skipped > 0 {
-        row(l.compact_lbl_packed_skipped(), scan.packed_skipped);
+        row(
+            l.compact_lbl_packed_skipped_label().pad(l.col_width_compact_summary),
+            l.int(scan.packed_skipped),
+        );
     }
     if scan.encrypted_skipped > 0 {
-        row(l.compact_lbl_encrypted_skipped(), scan.encrypted_skipped);
+        row(
+            l.compact_lbl_encrypted_skipped_label().pad(l.col_width_compact_summary),
+            l.int(scan.encrypted_skipped),
+        );
     }
     if scan.hardlinks_skipped > 0 {
-        row(l.compact_lbl_hardlinks_skipped(), scan.hardlinks_skipped);
+        row(
+            l.compact_lbl_hardlinks_skipped_label().pad(l.col_width_compact_summary),
+            l.int(scan.hardlinks_skipped),
+        );
     }
     if scan.unbeneficial_skipped > 0 {
-        row(l.compact_lbl_unbeneficial(), scan.unbeneficial_skipped);
+        row(
+            l.compact_lbl_unbeneficial_label().pad(l.col_width_compact_summary),
+            l.int(scan.unbeneficial_skipped),
+        );
     }
     if scan.excluded_type_skipped > 0 {
-        row(l.compact_lbl_excluded_type(), scan.excluded_type_skipped);
+        row(
+            l.compact_lbl_excluded_type_label().pad(l.col_width_compact_summary),
+            l.int(scan.excluded_type_skipped),
+        );
     }
     if scan.small_skipped > 0 {
         row(
-            &l.compact_lbl_small_skipped(args.min_size),
-            scan.small_skipped,
+            l.compact_lbl_small_skipped(&args.min_size).pad_with(
+                crate::i18n::runtime::decimal_digits(args.min_size),
+                l.col_width_compact_summary,
+            ),
+            l.int(scan.small_skipped),
         );
     }
     if scan.cloud_skipped > 0 {
-        row(l.lbl_cloud_skipped(), scan.cloud_skipped);
+        row(
+            l.report_lbl_cloud_skipped_label().pad(l.col_width_compact_summary),
+            l.int(scan.cloud_skipped),
+        );
     }
     if scan.sparse_skipped > 0 {
-        row(l.lbl_sparse_skipped(), scan.sparse_skipped);
+        row(
+            l.report_lbl_sparse_skipped_label().pad(l.col_width_compact_summary),
+            l.int(scan.sparse_skipped),
+        );
     }
     if scan.errors > 0 {
-        row(l.lbl_unreadable(), style(scan.errors).dim());
+        row(
+            l.report_lbl_unreadable_label().pad(l.col_width_compact_summary),
+            style(l.int(scan.errors)).dim(),
+        );
     }
 
     if !scan.candidates.is_empty() {
@@ -935,16 +973,14 @@ fn print_compact_report(
                 .sum();
             let g_saved: u64 = group.iter().map(|c| c.plan.est_saved_bytes).sum();
             let g_clusters: u64 = group.iter().map(|c| c.plan.est_saved_clusters).sum();
+            let files_plural = l.noun_file(group.len() as u64);
+            let g_log_s = format_size(g_logical, BINARY);
+            let g_est_s = format_size(g_est_phys, BINARY);
+            let g_sav_s = format_size(g_saved, BINARY);
             println!(
                 "    {:<10} {}",
                 style(alg.to_string()).cyan().bold(),
-                l.compact_alg_group_line(
-                    group.len(),
-                    format_size(g_logical, BINARY),
-                    format_size(g_est_phys, BINARY),
-                    format_size(g_saved, BINARY),
-                    g_clusters,
-                )
+                l.compact_alg_group_line(g_clusters, &files_plural, &g_log_s, &g_est_s, &g_sav_s)
             );
         }
 
@@ -953,8 +989,14 @@ fn print_compact_report(
         } else {
             10
         };
-        let [size, est, alg_col, saves, path] = l.compact_table_columns();
-        println!("\n  {size:>10}  {est:>6}  {alg_col:<10} {saves:>10}  {path}");
+        println!(
+            "\n  {}  {}  {}{}  {}",
+            l.compact_col_size_label().pad_left(l.col_width_compact_table_size),
+            l.compact_col_est_label().pad_left(l.col_width_compact_table_est),
+            l.compact_col_algorithm_label().pad(l.col_width_compact_table_alg),
+            l.compact_col_saves_label().pad_left(l.col_width_compact_table_saves),
+            l.compact_col_path()
+        );
         for c in scan.candidates.iter().take(shown) {
             let est_pct = if c.logical == 0 {
                 100.0
@@ -962,16 +1004,20 @@ fn print_compact_report(
                 c.plan.footprint.est_physical_bytes as f64 / c.logical as f64 * 100.0
             };
             println!(
-                "  {:>10}  {:>5.1}%  {:<10} {:>10}  {}",
+                "  {:>w_size$}  {}  {:<w_alg$}{:>w_saves$}  {}",
                 format_size(c.logical, BINARY),
-                est_pct,
+                l.decimal(est_pct, 1).pad_left_suffix("%", l.col_width_compact_table_est),
                 c.plan.target_alg.to_string(),
                 format_size(c.plan.est_saved_bytes, BINARY),
-                display_path(&c.path)
+                display_path(&c.path),
+                w_size = l.col_width_compact_table_size,
+                w_alg = l.col_width_compact_table_alg,
+                w_saves = l.col_width_compact_table_saves,
             );
         }
         if scan.candidates.len() > shown {
-            println!("  {}", l.more_items(scan.candidates.len() - shown));
+            let rem = l.int((scan.candidates.len() - shown) as u64);
+            println!("  {}", l.general_more_items(&rem));
         }
     }
 }

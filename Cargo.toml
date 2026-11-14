@@ -51,6 +51,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Ioctl",
 ] }
 
+[build-dependencies]
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+unicode-width = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
