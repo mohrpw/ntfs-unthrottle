@@ -1,0 +1,282 @@
+[meta]
+code = "de"
+name = "Deutsch"
+tags = ["de", "german", "deutsch"]
+plural_rule = "germanic"
+decimal_sep = ","
+thousand_sep = "."
+yes_no = "[j/N]"
+yes_tokens = ["j", "ja", "y", "yes"]
+
+[messages]
+# --- Allgemein ---
+"general.aborted" = "Abgebrochen."
+"general.no_interactive_console" = "Keine interaktive Konsole – zum Bestätigen --yes angeben."
+"general.more_items" = "… und {n} weitere (-v zeigt alle)"
+"general.word_off" = "aus"
+"general.word_active" = "aktiv"
+"general.not_queryable" = "nicht abfragbar"
+"general.not_queryable_err" = "nicht abfragbar ({err})"
+"general.status_ok" = "ok"
+"general.global_header" = "[Global]"
+
+# --- Bus-Namen ---
+"bus.sd_card" = "SD-Karte"
+"bus.storage_spaces" = "Speicherplätze"
+"bus.virtual" = "virtuell"
+"bus.unknown" = "unbekannt"
+
+# --- E/A-Fehler ---
+"error.locked" = "Datei ist von einem anderen Prozess geöffnet/gesperrt"
+"error.locked_vhdx" = "Datei ist von einem anderen Prozess geöffnet/gesperrt – bei .vhdx ggf. VM beenden, `wsl --shutdown` ausführen bzw. Docker schließen"
+"error.access_denied" = "Zugriff verweigert (ACL/Systemdatei – ggf. Terminal als Administrator starten)"
+"error.disk_full" = "Datenträger voll"
+"error.fs_limitation" = "NTFS-Grenze erreicht: Datei zu stark fragmentiert (vorher defragmentieren)"
+"error.fs_limitation_vhdx" = "NTFS-Grenze erreicht: Datei zu stark fragmentiert (vorher defragmentieren) – bei .vhdx alternativ `Optimize-VHD` oder die Datei umkopieren"
+"error.invalid_parameter" = "NTFS lehnt die Änderung ab (ungültiger Parameter – z. B. Cluster > 4 KiB oder Sparse-Konflikt)"
+
+# --- Geschützte Pfade ---
+"protected.system_folder" = "Systemordner"
+"protected.root_system_item" = "Systemdatei/-ordner in der Laufwerkswurzel"
+"protected.root_hidden_system" = "versteckt + System in der Laufwerkswurzel"
+
+# --- Scan: Vorbereitung & Fortschritt ---
+"scan.exclude_missing" = "--exclude {x}: existiert nicht – ignoriert."
+"scan.skipped_protected" = "Übersprungen: {path} – geschützt ({why}: {hit})."
+"scan.no_paths_left" = "Keine bearbeitbaren Pfade übrig."
+"scan.root_contained" = "{inner} ist in {outer} enthalten – wird nicht doppelt gescannt."
+"scan.spinner_entries" = "Einträge geprüft"
+"scan.bar_dirs_label" = "Ordner"
+"scan.bar_files_label" = "Dateien"
+
+# --- Scan: Volume / Datenträger ---
+"scan.fs_without_wof" = "Dateisystem {fs}: WOF/CompactOS gibt es nur auf NTFS – WOF-Prüfung entfällt."
+"scan.fs_without_wof_no_comp" = "Dateisystem {fs}: WOF/CompactOS gibt es nur auf NTFS – WOF-Prüfung entfällt, Datei-Komprimierung ebenfalls nicht unterstützt."
+"scan.ntfs_large_clusters" = "NTFS mit Clustern > 4 KiB: klassische NTFS-Komprimierung ist dort nicht möglich, WOF/CompactOS wird trotzdem geprüft."
+"scan.volume_info_unreadable" = "Volume-Info nicht lesbar"
+"scan.generic_drive" = "Datenträger"
+"scan.drive_line" = "Datenträger: {desc}"
+
+# --- Scan: Übergeordnete Ordner / Fix / Ergebnis ---
+"scan.ancestors_flagged" = "Übergeordnete Ordner tragen ebenfalls das Flag (neue Unterordner dort erben es):"
+"scan.drive_root_flag_hint" = "(Laufwerkswurzel – nur das Flag entfernen: compact /u {root})"
+"scan.nothing_found" = "Keine kontraproduktive Komprimierung gefunden."
+"scan.nothing_found_see_hints" = "Keine kontraproduktive Komprimierung gefunden (Hinweise oben beachten)."
+"scan.analysis_only_fix" = "Nur Analyse. Mit {flag} wird die Komprimierung entfernt."
+"scan.checking_free_space" = "Prüfe freien Platz …"
+"scan.not_enough_space" = "Nicht genug Platz auf {root}: frei {free}, benötigt inkl. Puffer {need}"
+"scan.confirm_decompress" = "▶ {files} und {dirs} jetzt entpacken? {yn}:"
+"scan.cleaning_up" = "Bereinige …"
+"scan.json_fix_requires_yes" = "--json zusammen mit --fix erfordert --yes (keine interaktive Abfrage im JSON-Modus)."
+"scan.interrupted_partial" = "Vom Benutzer abgebrochen (Strg+C) – Teilergebnis nach aktuellem Element:"
+"scan.heavily_fragmented_hint_defrag" = "Ganzes Volume (besonders auf HDD): defrag {vol} /U /V"
+"scan.result_header" = "=== Ergebnis ==="
+"scan.result_dir_flags" = "Ordner-Flags entfernt:"
+"scan.result_files" = "Dateien entpackt:"
+"scan.result_fragments" = "Fragmente abgebaut:"
+
+# --- Scan: Bericht ---
+"report.lbl_compressed_dirs" = "Komprimierte Ordner (Vererbung):"
+"report.keep_dir_flags_note" = "  (--keep-dir-flags: bleiben)"
+"report.only_dirs_filtered_note" = "  (--only: {kept} ausgewählt; --clear-dirs entfernt alle)"
+"report.lbl_throttled_files" = "Ausgebremste Dateien:"
+"report.lbl_data_volume" = "Datenvolumen:"
+"report.data_volume" = "{logical} logisch / {physical} physisch"
+"report.lbl_extra_space" = "Zusätzlicher Platzbedarf:"
+"report.lbl_kept" = "Sinnvoll komprimiert (bleibt):"
+"report.lbl_ds_detected" = "DirectStorage erkannt:"
+"report.lbl_small" = "Komprimiert, aber < {min_mib} MiB:"
+"report.small_ignored" = "{n} (ignoriert)"
+"report.tip_recommended" = "Tipp: --recommended erfasst Build-Ordner, VM-Images & Datenbanken auch darunter."
+"report.lbl_hardlink_dupes" = "Hardlink-Duplikate übersprungen:"
+"report.lbl_cloud_skipped" = "Cloud-Platzhalter übersprungen:"
+"report.lbl_sparse_skipped" = "Sparse-Dateien übersprungen:"
+"report.lbl_excluded" = "Ausgeschlossen:"
+"report.lbl_unreadable" = "Nicht lesbare Pfade:"
+"report.col_size" = "Größe"
+"report.col_phys" = "phys."
+"report.col_type" = "Art"
+"report.col_frags" = "Fragm."
+"report.col_reason" = "Grund"
+"report.col_path" = "Pfad"
+"report.compressed_dirs_list" = "Komprimierte Ordner:"
+
+# --- Gründe ---
+"reason.extension" = "Endung"
+"reason.low_savings" = "kaum Ersparnis"
+"reason.write_heavy" = "Schreiblast"
+"reason.build_dir" = "Build-Ordner"
+"reason.direct_storage" = "DirectStorage"
+"reason.forced" = "--all"
+
+# --- Speicher-Hinweise ---
+"ds.detected" = "DirectStorage erkannt: {game}"
+"ds.decompress_hint" = "Entpacken: {flag}  (alles im Spiel: ntfs-unthrottle \"{game}\" --all --fix)"
+"ds.nvme_heavy" = "NVMe {vol}: {size} in LZX/XPRESS16K-Dateien bleiben komprimiert. Auf schnellen\nNVMe-SSDs kann die Dekompression langsamer sein als die Rohleserate.\nWem Ladezeit wichtiger ist als Platz: ntfs-unthrottle \"<Ordner>\" --all --fix"
+
+# --- Optimierer ---
+"opt.tag" = "[Optimierer]"
+"opt.system_drive_suffix" = "  (Systemlaufwerk)"
+"opt.lbl_drive" = "Datenträger:"
+"opt.lbl_file_system" = "Dateisystem:"
+"opt.lbl_dev_drive" = "Dev Drive:"
+"opt.lbl_space" = "Platz:"
+"opt.lbl_cluster" = "Cluster:"
+"opt.lbl_mft" = "MFT:"
+"opt.lbl_short_names" = "8.3-Namen:"
+"opt.lbl_bypass_io" = "BypassIO:"
+"opt.lbl_indexer" = "Indexer:"
+"opt.lbl_last_access" = "Last-Access:"
+"opt.lbl_trim_ntfs" = "TRIM (NTFS):"
+"opt.lbl_trim_refs" = "TRIM (ReFS):"
+"opt.lbl_mft_zone" = "MFT-Zone:"
+"opt.type_unknown" = "Typ unbekannt"
+"opt.trim_yes" = ", TRIM ✔"
+"opt.trim_no" = ", kein TRIM"
+"opt.hint_qlc" = "{vol} ist eine QLC-SSD ({product}). Nach einigen GiB am Stück ist ihr SLC-Cache voll, dann fällt die Schreibrate auf HDD-Niveau – das ist Hardware, kein Einstellungsproblem. Große Entpack-/Kopierjobs besser auf einer TLC/NVMe-SSD ausführen und erst danach verschieben; mehr freier Platz vergrößert den Cache."
+"opt.hint_hdd" = "{vol} ist eine HDD: Viele kleine Dateien sind dort grundsätzlich langsam. Regelmäßig defragmentieren: `defrag {vol} /U /V`"
+"opt.hint_usb" = "{vol} hängt an USB – Durchsatz und Latenz sind durch Kabel/Gehäuse begrenzt, nicht durch NTFS."
+"opt.refs_info" = "ReFS – MFT/8.3 entfallen, TRIM siehe [Global]"
+"opt.dev_drive_trusted" = "vertrauenswürdig (Defender-Async-Modus; prüfen: `fsutil devdrv query {vol}`)"
+"opt.dev_drive_untrusted" = "nicht vertrauenswürdig – Defender scannt synchron und bremst"
+"opt.hint_dev_drive_untrusted" = "{vol} ist ein nicht vertrauenswürdiges Dev Drive: Defender-Performance-Modus aktivieren mit `fsutil devdrv trust {vol}` und Filter prüfen via `fsutil devdrv query {vol}`."
+"opt.dev_drive_no" = "nein (Standard-ReFS)"
+"opt.indexer_off" = "auf Volume oder über WSearch-Dienst aus"
+"opt.indexer_active_soft" = "Inhaltsindizierung auf {vol}-Root erlaubt (bei Build-Ordnern Indizierungsoptionen / Laufwerkseigenschaften prüfen)"
+"opt.indexer_system" = "auf Systemlaufwerk aktiv (normal für Windows-Suche)"
+"opt.space_line" = "{free} frei von {total} ({pct} %)"
+"opt.hint_full" = "{vol} ist zu über 90 % voll – NTFS findet kaum noch zusammenhängende Bereiche, neue Dateien zerstückeln."
+"opt.mft_line" = "{size} (≈ {million_records} Mio. Datensätze), Zone {zone}"
+"opt.hint_mft_fragmented" = "Die MFT auf {vol} ist zerstückelt. Windows kann sie im laufenden Betrieb nicht defragmentieren; nur offline/Drittanbieter oder Neuformatierung."
+"opt.admin_only" = "nur als Administrator abfragbar"
+"opt.short_names_system" = "aktiv (Systemlaufwerk – bewusst nicht geändert)"
+"opt.short_names_active" = "aktiv – kostet bei jedem neuen Dateinamen eine Kollisionsprüfung"
+"opt.fix_8dot3_global" = "8.3-Namen pro Volume steuerbar machen (global)"
+"opt.note_8dot3_global" = "Ändert nichts an C:, solange dort das Volume-Flag aktiv bleibt."
+"opt.fix_8dot3_volume" = "8.3-Namen auf {vol} abschalten"
+"opt.note_8dot3_volume" = "Bestehende Kurznamen bleiben – `8dot3name strip` wird bewusst nicht ausgeführt."
+"opt.dirty_bit_set" = "Dirty-Bit gesetzt"
+"opt.hint_dirty" = "{vol} ist als fehlerhaft markiert. Prüfen mit `chkdsk {vol} /scan` (online)."
+"opt.fs_clean" = "sauber"
+"opt.bypass_diag" = "Diagnose: `fsutil bypassIo state /v {root}` und `fltmc filters` (als Administrator)."
+"opt.bypass_no_storage" = "kein Veto, Speichertreiber meldet aber keine BypassIO-Fähigkeit"
+"opt.bypass_partial" = "partiell (Volume-/Speicher-Stack: {driver} – {hint})"
+"opt.hint_bypass_partial" = "BypassIO auf {vol} nur partiell: {driver} ({reason}, Status {status}). {hint} {diag}"
+"opt.bypass_blocked_by" = "blockiert durch {driver}"
+"opt.hint_bypass_blocked" = "BypassIO auf {vol} blockiert durch {driver} ({reason}, Status {status}): {hint}. {diag} Minifilter bitte NICHT per `fltmc unload` entladen – das kann Schutz- oder Sync-Funktionen abschalten."
+"opt.bypass_unavailable" = "nicht verfügbar (erst ab Windows 11)"
+"opt.driver_wof" = "WOF-Komprimierung (CompactOS/compact /exe) – betroffene Dateien mit `ntfs-unthrottle <Ordner> --recommended --fix` entpacken"
+"opt.driver_bitlocker" = "BitLocker-Verschlüsselung des Volumes"
+"opt.driver_volsnap" = "Volumeschattenkopie/Wiederherstellungspunkt aktiv"
+"opt.driver_storage" = "Speichertreiber ohne BypassIO (SATA/AHCI bzw. Intel RST/VMD) – nur der Microsoft-NVMe-Treiber (stornvme.sys) unterstützt BypassIO"
+"opt.driver_other" = "Filtertreiber (z. B. Virenscanner, Backup, Sync, Verschlüsselung) – Hersteller-Update prüfen"
+"opt.last_access_active" = "aktiv – jeder Lesezugriff schreibt einen Zeitstempel"
+"opt.fix_last_access" = "Last-Access-Zeitstempel abschalten"
+"opt.trim_ntfs_disabled" = "deaktiviert – die SSD wird mit der Zeit langsamer"
+"opt.fix_trim_ntfs" = "TRIM für NTFS aktivieren"
+"opt.trim_refs_disabled" = "deaktiviert – Dev Drive/ReFS-SSD wird mit der Zeit langsamer"
+"opt.fix_trim_refs" = "TRIM für ReFS aktivieren"
+"opt.trim_refs_unset" = "nicht gesetzt (Standard: aktiv)"
+"opt.mft_zone_small" = "Stufe {zone} – zu klein für Volumes mit Millionen Dateien"
+"opt.fix_mft_zone" = "Größere MFT-Zone reservieren (Stufe 2)"
+"opt.note_mft_zone" = "Wirkt erst nach einem Neustart und nur für künftiges MFT-Wachstum."
+"opt.mft_zone_level" = "Stufe {zone}"
+"opt.hints_header" = "Hinweise (nicht automatisch):"
+"opt.admin_needed" = "Einige Werte (MFT, Dirty-Bit) brauchen ein Terminal als Administrator."
+"opt.no_fixes_needed" = "Keine Korrekturen nötig."
+"opt.fixes_header" = "Korrekturen:"
+"opt.analysis_only_optimize" = "Nur Analyse. Mit {flag} werden die Korrekturen angewendet (als Administrator)."
+
+# --- Compact ---
+"compact.non_ntfs_skipped" = "Dateisystem {fs}: WOF-Komprimierung wird nur auf NTFS unterstützt – übersprungen."
+"compact.profile_line" = "Profil: {req} → {eff}"
+"compact.profile_line_qlc" = "Profil: {req} → {eff} (QLC-SSD < 20 % frei)"
+"compact.nothing_found" = "Keine passenden Dateien für WOF-Komprimierung gefunden."
+"compact.analysis_only" = "Nur Dry-Run. Mit {flag} wird die WOF-Komprimierung angewendet."
+"compact.compressing" = "Komprimiere …"
+"compact.lbl_candidates" = "Komprimierungs-Kandidaten:"
+"compact.lbl_est_savings" = "Geschätzte physische Ersparnis:"
+"compact.lbl_already_wof" = "Bereits WOF-komprimiert:"
+"compact.lbl_ds_skipped" = "DirectStorage auf NVMe übersprungen:"
+"compact.lbl_packed_skipped" = "Gepackte Executables übersprungen:"
+"compact.lbl_encrypted_skipped" = "EFS-verschlüsselte Dateien übersprungen:"
+"compact.lbl_hardlinks_skipped" = "Hardlink-Dateien übersprungen:"
+"compact.lbl_unbeneficial" = "Übersprungen (kaum Gewinn / Profil):"
+"compact.lbl_excluded_type" = "Ausgeschlossen (Typ/Build/Cache):"
+"compact.lbl_small_skipped" = "Unter {min_kib} KiB / 1 Cluster:"
+"compact.alg_group_header" = "Geplante WOF-Komprimierung nach Algorithmus:"
+"compact.col_size" = "Größe"
+"compact.col_est" = "gesch."
+"compact.col_algorithm" = "Algorithmus"
+"compact.col_saves" = "Ersparnis"
+"compact.col_path" = "Pfad"
+"compact.result_compressed" = "Dateien WOF-komprimiert:"
+"compact.result_not_beneficial" = "Vom Kernel übersprungen (kein Gewinn):"
+"compact.result_space_skipped" = "Übersprungen (zu wenig freier Platz):"
+"compact.result_actual_saved" = "Reale Netto-Ersparnis:"
+"compact.saved_val" = "{saved} ({before} → {after})"
+
+[plurals."noun.file"]
+one = "{count} Datei"
+other = "{count} Dateien"
+
+[plurals."noun.folder"]
+one = "{count} Ordner"
+other = "{count} Ordner"
+
+[plurals."scan.scanning_paths"]
+one = "Scanne {count} Pfad"
+other = "Scanne {count} Pfade"
+
+[plurals."scan.heavily_fragmented_header"]
+one = "{count} Datei hat weiterhin viele Fragmente (Extents blieben verteilt):"
+other = "{count} Dateien haben weiterhin viele Fragmente (Extents blieben verteilt):"
+
+[plurals."scan.items_failed"]
+one = "{count} Element konnte nicht geändert werden:"
+other = "{count} Elemente konnten nicht geändert werden:"
+
+[plurals."report.analysis_header"]
+one = "Analyse ({count} Eintrag in {secs} s)"
+other = "Analyse ({count} Einträge in {secs} s)"
+
+[plurals."report.kept_files"]
+one = "{count} Datei, spart {saved}"
+other = "{count} Dateien, sparen {saved}"
+
+[plurals."report.ds_moved"]
+one = "{game} – {count} WOF-Datei wird entpackt"
+other = "{game} – {count} WOF-Dateien werden entpackt"
+
+[plurals."ds.kept_body"]
+one = "{count} WOF-Datei ({size}) bleibt komprimiert. Auf NVMe verhindert WOF den\nBypassIO-Pfad (Windows 11) und bremst die Dekompression."
+other = "{count} WOF-Dateien ({size}) bleiben komprimiert. Auf NVMe verhindert WOF den\nBypassIO-Pfad (Windows 11) und bremst die Dekompression."
+
+[plurals."opt.checking_volumes"]
+one = "Prüfe {count} Volume"
+other = "Prüfe {count} Volumes"
+
+[plurals."opt.mft_line_frags"]
+one = "{size} (≈ {million_records} Mio. Datensätze), Zone {zone}, {count} Fragment"
+other = "{size} (≈ {million_records} Mio. Datensätze), Zone {zone}, {count} Fragmente"
+
+[plurals."opt.confirm_fixes"]
+one = "▶ {count} Korrektur jetzt anwenden? {yn}:"
+other = "▶ {count} Korrekturen jetzt anwenden? {yn}:"
+
+[plurals."opt.fixes_failed"]
+one = "{count} Korrektur fehlgeschlagen – meist fehlen Administratorrechte."
+other = "{count} Korrekturen fehlgeschlagen – meist fehlen Administratorrechte."
+
+[plurals."compact.confirm"]
+one = "▶ {count} Datei jetzt mit WOF komprimieren (geschätzte Ersparnis {est_saved})? {yn}:"
+other = "▶ {count} Dateien jetzt mit WOF komprimieren (geschätzte Ersparnis {est_saved})? {yn}:"
+
+[plurals."compact.est_savings_val"]
+one = "{saved} ({pct} %, {count} Cluster)"
+other = "{saved} ({pct} %, {count} Cluster)"
+
+[plurals."compact.alg_group_line"]
+one = "{files}: {logical} → ~{est_phys} (spart ~{saved}, {count} Cluster)"
+other = "{files}: {logical} → ~{est_phys} (spart ~{saved}, {count} Cluster)"
+

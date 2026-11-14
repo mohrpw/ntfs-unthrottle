@@ -6,6 +6,7 @@
 //! and chkdsk – these are only mentioned as hints with the matching command.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -21,8 +22,26 @@ use ntfs_unthrottle::tune::{
 };
 use ntfs_unthrottle::{display_path, fragment_count, volume_info};
 
-use crate::i18n::{tr, DriverHint};
+use crate::i18n::tr;
 use crate::put_path;
+
+/// Why a Windows driver blocks BypassIO (classified in `optimize.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverHint {
+    Wof,
+    BitLocker,
+    VolSnap,
+    StorageDriver,
+    Other,
+}
+
+struct HexStatus(u32);
+
+impl fmt::Display for HexStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{:08X}", self.0)
+    }
+}
 
 /// Known QLC SSD families: once the SLC cache is full, the write rate collapses.
 pub(crate) const QLC_MODELS: &[&str] = &["QVO", "660P", "670P", "CT500P1", "CT1000P1", "CT2000P1", "P2 ", "NV2"];
@@ -79,17 +98,35 @@ struct OptOut {
 impl OptOut {
     fn ok(self, label: OptLabel, value: impl std::fmt::Display) {
         if !self.json {
-            println!("  {} {:<13}{}", style("✔").green(), tr().opt_label(label), value);
+            let l = tr();
+            println!(
+                "  {} {}{}",
+                style("✔").green(),
+                l.opt_label(label).pad(l.col_width_optimize_labels),
+                value
+            );
         }
     }
     fn warn(self, label: OptLabel, value: impl std::fmt::Display) {
         if !self.json {
-            println!("  {} {:<13}{}", style("⚠").yellow().bold(), tr().opt_label(label), style(value).yellow());
+            let l = tr();
+            println!(
+                "  {} {}{}",
+                style("⚠").yellow().bold(),
+                l.opt_label(label).pad(l.col_width_optimize_labels),
+                style(value).yellow()
+            );
         }
     }
     fn info(self, label: OptLabel, value: impl std::fmt::Display) {
         if !self.json {
-            println!("  {} {:<13}{}", style("ℹ").blue(), tr().opt_label(label), value);
+            let l = tr();
+            println!(
+                "  {} {}{}",
+                style("ℹ").blue(),
+                l.opt_label(label).pad(l.col_width_optimize_labels),
+                value
+            );
         }
     }
 }
@@ -170,7 +207,11 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
     let mut admin_hint = false;
 
     if !json_mode {
-        println!("{} {}\n", style(l.opt_tag()).bold().cyan(), l.opt_checking_volumes(volumes.len()));
+        println!(
+            "{} {}\n",
+            style(l.opt_tag()).bold().cyan(),
+            l.opt_checking_volumes(volumes.len() as u64)
+        );
     }
 
     for root in volumes.values() {
@@ -191,7 +232,7 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
                 "{} {}{}",
                 style(format!("[{}]", display_path(root))).bold(),
                 vi.fs_name,
-                if is_system { l.system_drive_suffix() } else { "" }
+                if is_system { l.opt_system_drive_suffix() } else { "" }
             );
         }
 
@@ -201,13 +242,17 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
                 let kind = match d.seek_penalty {
                     Some(true) => "HDD",
                     Some(false) => "SSD",
-                    None => l.type_unknown(),
+                    None => l.opt_type_unknown(),
                 };
-                let trim = l.trim_suffix(d.trim_supported);
+                let trim = match d.trim_supported {
+                    Some(true) => l.opt_trim_yes(),
+                    Some(false) => l.opt_trim_no(),
+                    None => "",
+                };
                 let line = format!(
                     "{} ({}, {kind}{trim})",
                     d.product.as_deref().unwrap_or("?"),
-                    d.bus.map_or("?", |b| l.bus(b))
+                    d.bus.map_or("?", |b| l.bus_name(b))
                 );
                 is_nvme = d.bus == Some("NVMe");
                 if d.seek_penalty == Some(false) {
@@ -216,16 +261,17 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
                 }
                 let product = d.product.as_deref().unwrap_or("").to_uppercase();
                 if QLC_MODELS.iter().any(|m| product.contains(m)) {
-                    plan.hints.push(l.hint_qlc(&vol, d.product.as_deref().unwrap_or("?")));
+                    let prod = d.product.as_deref().unwrap_or("?");
+                    plan.hints.push(l.opt_hint_qlc(&vol, &prod).to_string());
                 }
                 match (d.seek_penalty, d.bus) {
                     (Some(true), _) => {
                         out.warn(OptLabel::Drive, line);
-                        plan.hints.push(l.hint_hdd(&vol));
+                        plan.hints.push(l.opt_hint_hdd(&vol).to_string());
                     }
                     (_, Some("USB")) => {
                         out.warn(OptLabel::Drive, line);
-                        plan.hints.push(l.hint_usb(&vol));
+                        plan.hints.push(l.opt_hint_usb(&vol).to_string());
                     }
                     _ => out.ok(OptLabel::Drive, line),
                 }
@@ -237,7 +283,7 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
                 })
             }
             Err(e) => {
-                let msg = l.not_queryable_err(&e);
+                let msg = l.general_not_queryable_err(&e);
                 out.info(OptLabel::Drive, msg);
                 json!({ "error": e.to_string() })
             }
@@ -245,16 +291,16 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
         vj.insert("device".into(), dev_json);
 
         let dev_drive_json = if is_refs {
-            out.info(OptLabel::FileSystem, l.refs_info());
+            out.info(OptLabel::FileSystem, l.opt_refs_info());
             match dev_drive_info(root) {
                 Ok(dd) => {
                     if dd.is_dev_drive && dd.is_trusted {
-                        out.ok(OptLabel::DevDrive, l.dev_drive_trusted(&vol));
+                        out.ok(OptLabel::DevDrive, l.opt_dev_drive_trusted(&vol));
                     } else if dd.is_dev_drive {
-                        out.warn(OptLabel::DevDrive, l.dev_drive_untrusted());
-                        plan.hints.push(l.hint_dev_drive_untrusted(&vol));
+                        out.warn(OptLabel::DevDrive, l.opt_dev_drive_untrusted());
+                        plan.hints.push(l.opt_hint_dev_drive_untrusted(&vol).to_string());
                     } else {
-                        out.info(OptLabel::DevDrive, l.dev_drive_no());
+                        out.info(OptLabel::DevDrive, l.opt_dev_drive_no());
                     }
                     json!({
                         "is_dev_drive": dd.is_dev_drive,
@@ -262,12 +308,12 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
                     })
                 }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    out.info(OptLabel::DevDrive, l.admin_only());
+                    out.info(OptLabel::DevDrive, l.opt_admin_only());
                     admin_hint = true;
                     json!({ "error": "permission_denied", "permission_denied": true })
                 }
                 Err(e) => {
-                    let msg = l.not_queryable_err(&e);
+                    let msg = l.general_not_queryable_err(&e);
                     out.info(OptLabel::DevDrive, msg);
                     json!({ "error": e.to_string(), "permission_denied": false })
                 }
@@ -282,14 +328,13 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
             let ntfs_json = match ntfs_data(root) {
                 Ok(n) => {
                     let free_pct = n.free_bytes as f64 / n.total_bytes.max(1) as f64 * 100.0;
-                    let line = l.space_line(
-                        format_size(n.free_bytes, BINARY),
-                        format_size(n.total_bytes, BINARY),
-                        free_pct,
-                    );
+                    let free_s = format_size(n.free_bytes, BINARY);
+                    let total_s = format_size(n.total_bytes, BINARY);
+                    let pct_d = l.decimal(free_pct, 0);
+                    let line = l.opt_space_line(&free_s, &total_s, &pct_d);
                     if free_pct < 10.0 {
                         out.warn(OptLabel::Space, line);
-                        plan.hints.push(l.hint_full(&vol));
+                        plan.hints.push(l.opt_hint_full(&vol).to_string());
                     } else {
                         out.ok(OptLabel::Space, line);
                     }
@@ -297,22 +342,22 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
 
                     let records = n.mft_records();
                     let frags = fragment_count(&root.join("$MFT")).ok();
-                    let mut line = l.mft_line(
-                        format_size(n.mft_valid_length, BINARY),
-                        records as f64 / 1e6,
-                        format_size(n.mft_zone_bytes, BINARY),
-                    );
-                    if let Some(f) = frags {
-                        line.push_str(&l.mft_fragments(f));
-                    }
+                    let size_s = format_size(n.mft_valid_length, BINARY);
+                    let mrec_d = l.decimal(records as f64 / 1e6, 1);
+                    let zone_s = format_size(n.mft_zone_bytes, BINARY);
                     if records >= LARGE_MFT_RECORDS {
                         any_large_mft = true;
                     }
-                    if frags.is_some_and(|f| f >= MFT_FRAGMENT_WARN) {
-                        out.warn(OptLabel::Mft, line);
-                        plan.hints.push(l.hint_mft_fragmented(&vol));
+                    if let Some(f) = frags {
+                        let line = l.opt_mft_line_frags(f, &size_s, &mrec_d, &zone_s);
+                        if f >= MFT_FRAGMENT_WARN {
+                            out.warn(OptLabel::Mft, line);
+                            plan.hints.push(l.opt_hint_mft_fragmented(&vol).to_string());
+                        } else {
+                            out.ok(OptLabel::Mft, line);
+                        }
                     } else {
-                        out.ok(OptLabel::Mft, line);
+                        out.ok(OptLabel::Mft, l.opt_mft_line(&size_s, &mrec_d, &zone_s));
                     }
                     json!({
                         "free_bytes": n.free_bytes,
@@ -325,7 +370,7 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
                     })
                 }
                 Err(_) => {
-                    out.info(OptLabel::Mft, l.admin_only());
+                    out.info(OptLabel::Mft, l.opt_admin_only());
                     admin_hint = true;
                     json!({ "error": "permission_denied", "permission_denied": true })
                 }
@@ -343,20 +388,24 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
             };
             vj.insert("short_names_enabled".into(), json!(enabled));
             match enabled {
-                Some(false) => out.ok(OptLabel::ShortNames, l.word_off()),
-                Some(true) if is_system => out.info(OptLabel::ShortNames, l.short_names_system()),
+                Some(false) => out.ok(OptLabel::ShortNames, l.general_word_off()),
+                Some(true) if is_system => out.info(OptLabel::ShortNames, l.opt_short_names_system()),
                 Some(true) => {
-                    out.warn(OptLabel::ShortNames, l.short_names_active());
+                    out.warn(OptLabel::ShortNames, l.opt_short_names_active());
                     if reg_8dot3 == Some(0) {
-                        plan.fix(l.fix_8dot3_global(), &["8dot3name", "set", "2"], Some(l.note_8dot3_global()));
+                        plan.fix(
+                            l.opt_fix_8dot3_global(),
+                            &["8dot3name", "set", "2"],
+                            Some(l.opt_note_8dot3_global()),
+                        );
                     }
                     plan.fix(
-                        l.fix_8dot3_volume(&vol),
+                        l.opt_fix_8dot3_volume(&vol).to_string(),
                         &["8dot3name", "set", &vol, "1"],
-                        Some(l.note_8dot3_volume()),
+                        Some(l.opt_note_8dot3_volume()),
                     );
                 }
-                None => out.info(OptLabel::ShortNames, l.not_queryable()),
+                None => out.info(OptLabel::ShortNames, l.general_not_queryable()),
             }
 
             // --- Dirty bit ----------------------------------------------------
@@ -364,55 +413,52 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
             vj.insert("dirty".into(), json!(dirty_res.as_ref().ok().copied()));
             match dirty_res {
                 Ok(true) => {
-                    out.warn(OptLabel::FileSystem, l.dirty_bit_set());
-                    plan.hints.push(l.hint_dirty(&vol));
+                    out.warn(OptLabel::FileSystem, l.opt_dirty_bit_set());
+                    plan.hints.push(l.opt_hint_dirty(&vol).to_string());
                 }
-                Ok(false) => out.ok(OptLabel::FileSystem, l.fs_clean()),
+                Ok(false) => out.ok(OptLabel::FileSystem, l.opt_fs_clean()),
                 Err(_) => admin_hint = true,
             }
 
             // --- BypassIO (diagnosis only, never unload filters) ------------
-            let diag = l.bypass_diag(display_path(root));
+            let root_disp = display_path(root);
+            let diag = l.opt_bypass_diag(&root_disp);
             let bypass_res = bypass_io_status(root);
             vj.insert("bypass_io".into(), bypass_to_json(&bypass_res));
             match bypass_res {
                 Ok(BypassIoStatus::Active { storage_compatible: true }) => {
-                    out.ok(OptLabel::BypassIo, l.word_active());
+                    out.ok(OptLabel::BypassIo, l.general_word_active());
                 }
                 Ok(BypassIoStatus::Active { storage_compatible: false }) => {
-                    out.info(OptLabel::BypassIo, l.bypass_no_storage());
+                    out.info(OptLabel::BypassIo, l.opt_bypass_no_storage());
                 }
                 Ok(BypassIoStatus::Partial { driver, status, reason }) => {
-                    out.info(OptLabel::BypassIo, l.bypass_partial(&driver, bypass_driver_hint(&driver)));
+                    let hint = bypass_driver_hint(&driver);
+                    out.info(OptLabel::BypassIo, l.opt_bypass_partial(&driver, &hint));
                     if is_nvme {
-                        plan.hints.push(l.hint_bypass_partial(
-                            &vol,
-                            &driver,
-                            &reason,
-                            status,
-                            bypass_driver_hint(&driver),
-                            &diag,
-                        ));
+                        let status_hex = HexStatus(status);
+                        plan.hints.push(
+                            l.opt_hint_bypass_partial(&vol, &driver, &reason, &status_hex, &hint, &diag)
+                                .to_string(),
+                        );
                     }
                 }
                 Ok(BypassIoStatus::Blocked { driver, status, reason }) => {
-                    let line = l.bypass_blocked_by(&driver);
+                    let line = l.opt_bypass_blocked_by(&driver);
                     if is_nvme {
                         out.warn(OptLabel::BypassIo, line);
                     } else {
                         out.info(OptLabel::BypassIo, line);
                     }
-                    plan.hints.push(l.hint_bypass_blocked(
-                        &vol,
-                        &driver,
-                        &reason,
-                        status,
-                        bypass_driver_hint(&driver),
-                        &diag,
-                    ));
+                    let hint = bypass_driver_hint(&driver);
+                    let status_hex = HexStatus(status);
+                    plan.hints.push(
+                        l.opt_hint_bypass_blocked(&vol, &driver, &reason, &status_hex, &hint, &diag)
+                            .to_string(),
+                    );
                 }
-                Ok(BypassIoStatus::Unavailable) => out.info(OptLabel::BypassIo, l.bypass_unavailable()),
-                Err(e) => out.info(OptLabel::BypassIo, l.not_queryable_err(e)),
+                Ok(BypassIoStatus::Unavailable) => out.info(OptLabel::BypassIo, l.opt_bypass_unavailable()),
+                Err(e) => out.info(OptLabel::BypassIo, l.general_not_queryable_err(&e)),
             }
         } else {
             vj.insert("ntfs".into(), Value::Null);
@@ -432,13 +478,13 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
                 }),
             );
             if idx.service_disabled == Some(true) || idx.root_not_indexed == Some(true) {
-                out.ok(OptLabel::Indexer, l.indexer_off());
+                out.ok(OptLabel::Indexer, l.opt_indexer_off());
             } else if is_system {
-                out.info(OptLabel::Indexer, l.indexer_system());
+                out.info(OptLabel::Indexer, l.opt_indexer_system());
             } else if idx.root_not_indexed == Some(false) {
-                out.info(OptLabel::Indexer, l.indexer_active_soft(&vol));
+                out.info(OptLabel::Indexer, l.opt_indexer_active_soft(&vol));
             } else {
-                out.info(OptLabel::Indexer, l.not_queryable());
+                out.info(OptLabel::Indexer, l.general_not_queryable());
             }
         } else {
             vj.insert("indexer".into(), Value::Null);
@@ -451,24 +497,24 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
 
     // --- Global switches ---------------------------------------------------
     if !json_mode {
-        println!("{}", style("[Global]").bold());
+        println!("{}", style(l.general_global_header()).bold());
     }
     let last_access_reg = filesystem_reg_value("NtfsDisableLastAccessUpdate");
     match last_access_reg {
-        Some(v) if v & 1 == 1 => out.ok(OptLabel::LastAccess, l.word_off()),
+        Some(v) if v & 1 == 1 => out.ok(OptLabel::LastAccess, l.general_word_off()),
         _ => {
-            out.warn(OptLabel::LastAccess, l.last_access_active());
-            plan.fix(l.fix_last_access(), &["behavior", "set", "disablelastaccess", "1"], None);
+            out.warn(OptLabel::LastAccess, l.opt_last_access_active());
+            plan.fix(l.opt_fix_last_access(), &["behavior", "set", "disablelastaccess", "1"], None);
         }
     }
     let trim_ntfs_reg = if any_ntfs_ssd {
         let v = filesystem_reg_value("DisableDeleteNotification");
         match v {
             Some(1) => {
-                out.warn(OptLabel::TrimNtfs, l.trim_ntfs_disabled());
-                plan.fix(l.fix_trim_ntfs(), &["behavior", "set", "DisableDeleteNotify", "NTFS", "0"], None);
+                out.warn(OptLabel::TrimNtfs, l.opt_trim_ntfs_disabled());
+                plan.fix(l.opt_fix_trim_ntfs(), &["behavior", "set", "DisableDeleteNotify", "NTFS", "0"], None);
             }
-            _ => out.ok(OptLabel::TrimNtfs, l.word_active()),
+            _ => out.ok(OptLabel::TrimNtfs, l.general_word_active()),
         }
         Some(v)
     } else {
@@ -479,11 +525,11 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
         let v = refs_trim_disabled();
         match v {
             Some(true) => {
-                out.warn(OptLabel::TrimRefs, l.trim_refs_disabled());
-                plan.fix(l.fix_trim_refs(), &["behavior", "set", "DisableDeleteNotify", "ReFS", "0"], None);
+                out.warn(OptLabel::TrimRefs, l.opt_trim_refs_disabled());
+                plan.fix(l.opt_fix_trim_refs(), &["behavior", "set", "DisableDeleteNotify", "ReFS", "0"], None);
             }
-            Some(false) => out.ok(OptLabel::TrimRefs, l.word_active()),
-            None => out.info(OptLabel::TrimRefs, l.trim_refs_unset()),
+            Some(false) => out.ok(OptLabel::TrimRefs, l.general_word_active()),
+            None => out.info(OptLabel::TrimRefs, l.opt_trim_refs_unset()),
         }
         Some(v)
     } else {
@@ -491,11 +537,12 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
     };
     // 0 or missing = default (level 1).
     let zone = filesystem_reg_value("NtfsMftZoneReservation").unwrap_or(0).max(1);
+    let zone_int = l.int(zone);
     if any_large_mft && zone < 2 {
-        out.warn(OptLabel::MftZone, l.mft_zone_small(zone));
-        plan.fix(l.fix_mft_zone(), &["behavior", "set", "mftzone", "2"], Some(l.note_mft_zone()));
+        out.warn(OptLabel::MftZone, l.opt_mft_zone_small(&zone_int));
+        plan.fix(l.opt_fix_mft_zone(), &["behavior", "set", "mftzone", "2"], Some(l.opt_note_mft_zone()));
     } else {
-        out.ok(OptLabel::MftZone, l.mft_zone_level(zone));
+        out.ok(OptLabel::MftZone, l.opt_mft_zone_level(&zone_int));
     }
 
     let global_json = json!({
@@ -522,13 +569,13 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
     // --- Output & apply ------------------------------------------------------
     if !json_mode {
         if !plan.hints.is_empty() {
-            println!("\n{}", style(l.hints_header()).bold());
+            println!("\n{}", style(l.opt_hints_header()).bold());
             for h in &plan.hints {
                 println!("  • {h}");
             }
         }
         if admin_hint {
-            println!("\n  {} {}", style("ℹ").blue(), l.admin_needed());
+            println!("\n  {} {}", style("ℹ").blue(), l.opt_admin_needed());
         }
     }
 
@@ -536,13 +583,13 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
         if json_mode {
             emit_optimize_json(&volumes_json, &global_json, &plan.hints, admin_hint, &fixes_json, None, 0)?;
         } else {
-            println!("\n{} {}", style("✔").green().bold(), l.no_fixes_needed());
+            println!("\n{} {}", style("✔").green().bold(), l.opt_no_fixes_needed());
         }
         return Ok(ExitCode::SUCCESS);
     }
 
     if !json_mode {
-        println!("\n{}", style(l.fixes_header()).bold());
+        println!("\n{}", style(l.opt_fixes_header()).bold());
         for f in &plan.fixes {
             println!("  • {}", f.title);
             println!("      {}", style(format!("fsutil {}", f.args.join(" "))).dim());
@@ -556,10 +603,11 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
         if json_mode {
             emit_optimize_json(&volumes_json, &global_json, &plan.hints, admin_hint, &fixes_json, None, 0)?;
         } else {
+            let flag = style("--optimize --fix").yellow().bold();
             println!(
                 "\n{} {}",
                 style("ℹ").blue().bold(),
-                l.analysis_only_optimize(style("--optimize --fix").yellow().bold())
+                l.opt_analysis_only_optimize(&flag)
             );
         }
         return Ok(ExitCode::from(crate::EXIT_FOUND));
@@ -567,15 +615,16 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
 
     if !yes {
         if json_mode {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, l.json_fix_requires_yes()));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, l.scan_json_fix_requires_yes()));
         }
+        let yn = l.yes_no();
         let prompt = format!(
             "\n{}\n{} ",
             style("─".repeat(60)).yellow(),
-            style(l.confirm_fixes(plan.fixes.len())).yellow().bold()
+            style(l.opt_confirm_fixes(plan.fixes.len() as u64, &yn)).yellow().bold()
         );
         if !crate::confirm(&prompt)? {
-            println!("{}", l.aborted());
+            println!("{}", l.general_aborted());
             return Ok(ExitCode::SUCCESS);
         }
     }
@@ -642,7 +691,7 @@ pub fn run(paths: &[PathBuf], apply: bool, yes: bool, json_mode: bool) -> io::Re
     }
     if failed > 0 {
         if !json_mode {
-            println!("\n  {} {}", style("⚠").yellow().bold(), l.fixes_failed(failed));
+            println!("\n  {} {}", style("⚠").yellow().bold(), l.opt_fixes_failed(failed as u64));
         }
         return Ok(ExitCode::from(crate::EXIT_PARTIAL));
     }

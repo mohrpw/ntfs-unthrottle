@@ -14,11 +14,12 @@ and `--help` are written in **English**; only runtime messages are localized.
 | `src/tune.rs` | Read-only queries for `--optimize`: storage device (bus, SSD/HDD, TRIM), NTFS volume data, 8.3 names, dirty bit, BypassIO, registry switches, `fsutil` output decoding/parsing. |
 | `src/main.rs` | CLI (`clap`), directory walk, candidate selection (`--recommended`, `--all`, …), poka-yoke protection, DirectStorage/NVMe rules, report and cleanup. |
 | `src/optimize.rs` | `--optimize`: volume/hardware diagnostics and the safe `fsutil` fixes. |
-| `src/i18n.rs` | Language detection (`--lang`, `LC_ALL`/`LC_MESSAGES`/`LANG`, Windows UI language) and **all** localized runtime messages. |
+| `locales/<lang>.toml` | Single-file-per-language translations (`en.toml` is the canonical schema, plus `[meta]`, `[messages]`, `[plurals]`). |
+| `build.rs` & `src/i18n/` | Compile-time TOML validation, CJK-safe column-width computation, zero-allocation code generation (`runtime.rs`, `mod.rs`), and language detection (`--lang`, `LC_ALL`/`LC_MESSAGES`/`LANG`, `GetUserPreferredUILanguages`). |
 
-Every user-visible runtime string lives in `src/i18n.rs` as a method on `Lang` with an
-exhaustive `match`. `main.rs` and `optimize.rs` only call these methods (`tr().aborted()`,
-`l.scanning_paths(n)`, …) – please do not add hard-coded user-facing text elsewhere.
+Every user-visible runtime string lives in `locales/<lang>.toml`. `main.rs`, `compact.rs` and
+`optimize.rs` only call the methods generated on `Locale` via `tr()` – please do not add
+hard-coded user-facing text elsewhere.
 
 ## Development
 
@@ -36,25 +37,29 @@ Without `--fix` the tool never modifies anything, so dry runs are always safe.
 
 ## Adding a New Language (i18n)
 
-The i18n layer is deliberately dependency-free. The compiler guides you through every
-missing translation.
+Adding or updating a language requires editing **only a single file** (`locales/<lang>.toml`) –
+zero Rust code changes are needed, and the runtime binary keeps **0 bytes** of extra
+dependencies. `build.rs` checks every key, placeholder, plural form and column width against
+`locales/en.toml` at compile time.
 
-1. **Add the variant.** In `src/i18n.rs`, add a variant to `enum Lang` (e.g. `Fr`) and a
-   matching CLI value to `enum LangChoice` (e.g. `/// French (Français)` + `Fr`), and map
-   it in `detect()`.
-2. **Map detection.** Teach `parse_lang_tag()` the new tag (e.g. `"fr" | "french"`) and
-   `from_win32_lang_id()` the Windows *primary* language ID (`lang_id & 0x3FF`, e.g.
-   `0x0C` for French – see Microsoft's *Language Identifier Constants*).
-3. **Translate.** Run `cargo build`. Every message method in `src/i18n.rs` now fails with a
-   "non-exhaustive patterns" error – add a `Lang::Fr => …` arm (or extend a tuple pattern
-   such as `(Lang::Fr, Reason::Extension)`) to each one until it compiles. Don't forget
-   `yes_no()` / `is_yes()` for the confirmation prompt, and keep the column-width limits
-   checked by the `labels_fit_their_columns` test (reasons ≤ 14, optimizer labels ≤ 12
-   characters).
-4. **Verify.** Extend the unit tests in `src/i18n.rs` (tag parsing, LANGID mapping,
-   yes/no answers), then run `cargo test` and try `cargo run -- --lang fr --optimize`.
-   Optionally add a translated `README.<code>.md` and link it from the language line at the
-   top of `README.md`.
+1. **Copy the canonical file.** Duplicate `locales/en.toml` as `locales/<lang>.toml` (e.g.
+   `locales/fr.toml`).
+2. **Update `[meta]`.** Set:
+   - `code = "fr"` and human-readable `name = "Français"`
+   - `tags = ["fr", "french"]` (lowercase BCP-47/POSIX base tags; Windows/POSIX regions like
+     `fr-CA` or `fr_FR.UTF-8` automatically fall back to `fr`, and `zh-Hans-CN` falls back
+     through `zh-hans` → `zh`)
+   - `plural_rule` (`"none"`, `"germanic"`, `"french"`, `"slavic"`, or `"arabic"`)
+   - `decimal_sep`, `thousand_sep`, `yes_no` (e.g. `"[o/N]"`) and `yes_tokens` (e.g.
+     `["o", "oui", "y", "yes"]`)
+3. **Translate `[messages]` and `[plurals.*]`.** Keep `{placeholder}` names unchanged (you may
+   freely reorder them to match natural grammar; in `one`/`zero`/`few`/`many` plural variants,
+   omitting `{count}` is allowed). Never insert ASCII control characters (except `\n`) or Unicode
+   Bidi overrides. Column widths for aligned summaries and tables are automatically measured by
+   `build.rs` via `unicode-width`.
+4. **Verify.** Run `cargo test`, `cargo clippy --all-targets -- -D warnings`, and try
+   `cargo run -- --lang <lang> --optimize`. Optionally add a translated `README.<code>.md` and
+   link it from the language line at the top of `README.md`.
 
 ## Ground Rules
 
