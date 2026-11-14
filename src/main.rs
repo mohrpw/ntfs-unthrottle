@@ -13,9 +13,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod compact;
+mod exts;
 mod i18n;
 mod optimize;
 mod probe;
+
+use exts::{has_ext, HIGH_ENTROPY_EXTS, WRITE_HEAVY_EXTS};
 
 use clap::Parser;
 use console::style;
@@ -46,32 +49,6 @@ use windows_sys::Win32::System::Console::{
 pub(crate) const CLOUD_ATTRS: u32 =
     FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN;
 
-/// Known high-entropy formats (already compressed or encrypted).
-pub(crate) const HIGH_ENTROPY_EXTS: &[&str] = &[
-    // Compressed / encrypted binary containers
-    "xci", "xcz", "nsp", "nsz", "nca", "ncz",
-    // Archives
-    "zip", "7z", "rar", "zst", "gz", "xz", "bz2", "lz4", "cab", "msi",
-    // Media
-    "mp4", "mkv", "webm", "mov", "avi", "mp3", "flac", "ogg", "opus", "jpg", "jpeg", "png", "webp", "heic",
-    // Disk images & game asset containers
-    "iso", "chd", "rvz", "wbfs", "cso", "pak", "ucas", "utoc", "bundle", "vpk",
-    // Encrypted containers
-    "hc", "tc", "vc", "kdbx", "gpg",
-];
-
-/// --recommended: formats with many (random) writes. Compression fragments
-/// them heavily (up to ERROR_FILE_SYSTEM_LIMITATION) – always decompress.
-pub(crate) const WRITE_HEAVY_EXTS: &[&str] = &[
-    // VM images & snapshots
-    "vhd", "vhdx", "avhdx", "vmdk", "vdi", "qcow2", "vmem", "vmsn", "vmss", "nvram",
-    // Databases
-    "db", "db-wal", "db-shm", "sqlite", "sqlite3", "mdf", "ldf", "ndf", "edb", "ibd",
-    "mdb", "accdb", "ldb", "pst", "ost",
-    // Incomplete downloads (written block by block in random order)
-    "part", "partial", "crdownload", "!qb", "!ut", "aria2",
-];
-
 /// --recommended: build/tooling folders with many small, constantly rewritten
 /// files – everything inside is decompressed, regardless of size/ratio.
 /// These names are unambiguous enough to count without further checks.
@@ -95,12 +72,6 @@ const GENERIC_BUILD_DIRS: &[(&str, &[&str])] = &[
     ("target", &["Cargo.toml", "pom.xml"]),
     ("obj", &["*.csproj", "*.vcxproj", "*.fsproj", "*.vbproj", "*.sln"]),
 ];
-
-pub(crate) fn has_ext(path: &Path, list: &[&str]) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| list.contains(&e.to_ascii_lowercase().as_str()))
-}
 
 /// Does `dir` contain one of the `markers`? (Case-insensitive.)
 fn is_project_dir(dir: &Path, markers: &[&str]) -> bool {

@@ -26,6 +26,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_SPARSE_FILE,
 };
 
+use crate::exts::{has_ext, COMPACT_SKIP_EXTS, HIGH_ENTROPY_EXTS, WRITE_HEAVY_EXTS};
 use crate::i18n::tr;
 use crate::optimize::QLC_MODELS;
 use crate::probe::{
@@ -33,14 +34,11 @@ use crate::probe::{
     XpressHuffProbe,
 };
 use crate::{
-    comp_eq, confirm, dedup_roots, ds_game_root, file_name, fold, has_ext, in_build_dir,
-    make_file_bar, make_spinner, parse_percent, path_obj, put_path, resolve_scan_roots, under,
-    CtrlHandlerGuard, EtaTracker, Excludes, RootInfo, CLOUD_ATTRS, DS_DLLS, EXIT_FOUND,
-    EXIT_INTERRUPTED, EXIT_PARTIAL, HIGH_ENTROPY_EXTS, INTERRUPTED, WRITE_HEAVY_EXTS,
+    comp_eq, confirm, dedup_roots, ds_game_root, file_name, fold, in_build_dir, make_file_bar,
+    make_spinner, parse_percent, path_obj, put_path, resolve_scan_roots, under, CtrlHandlerGuard,
+    EtaTracker, Excludes, RootInfo, CLOUD_ATTRS, DS_DLLS, EXIT_FOUND, EXIT_INTERRUPTED,
+    EXIT_PARTIAL, INTERRUPTED,
 };
-
-/// Boot/early-load driver extensions that must never be WOF-compressed, even outside `C:\Windows`.
-const COMPACT_SKIP_EXTS: &[&str] = &["sys", "efi"];
 
 /// Gaming and GPU/shader cache directory names excluded from WOF compression.
 const CACHE_DIRS: &[&str] = &[
